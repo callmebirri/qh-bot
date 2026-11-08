@@ -5,6 +5,7 @@ import dev.kord.common.entity.ButtonStyle
 import dev.kord.common.entity.TextInputStyle
 import dev.kord.core.Kord
 import dev.kord.core.behavior.interaction.modal
+import dev.kord.core.behavior.interaction.respondEphemeral
 import dev.kord.core.behavior.interaction.response.respond
 import dev.kord.core.event.interaction.ButtonInteractionCreateEvent
 import dev.kord.core.event.interaction.ModalSubmitInteractionCreateEvent
@@ -85,13 +86,17 @@ class RecoveryInteractionEvent(
                                 otpProvider = {
                                     val otpDeferred = CompletableDeferred<String>()
                                     pendingOtpSessions[sessionId] = otpDeferred
-                                    response.respond {
-                                        content = "Mã OTP đã được gửi đến proof bảo mật của `$email`.\nNhấn nút bên dưới để nhập mã OTP:"
-                                        actionRow {
-                                            interactionButton(ButtonStyle.Primary, "open_otp_modal:$sessionId") {
-                                                label = "Nhập mã OTP"
+                                    runCatching {
+                                        response.respond {
+                                            content = "Mã OTP đã được gửi đến proof bảo mật của `$email`.\nNhấn nút bên dưới để nhập mã OTP:"
+                                            actionRow {
+                                                interactionButton(ButtonStyle.Primary, "open_otp_modal:$sessionId") {
+                                                    label = "Nhập mã OTP"
+                                                }
                                             }
                                         }
+                                    }.onFailure { err ->
+                                        logger.error("Failed to respond with OTP button: {}", err.message)
                                     }
                                     try {
                                         withTimeout(120_000L) {
@@ -151,8 +156,7 @@ class RecoveryInteractionEvent(
                     val sessionId = modalId.substringAfter("recovery_step2_modal:")
                     val otp = interaction.textInputs["otp_input"]?.value?.trim().orEmpty()
 
-                    val response = interaction.deferEphemeralResponse()
-                    response.respond {
+                    interaction.respondEphemeral {
                         content = "Đã nhận mã OTP. Đang xử lý khôi phục và bảo mật tài khoản..."
                     }
 
