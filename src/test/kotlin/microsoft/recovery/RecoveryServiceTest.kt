@@ -355,4 +355,33 @@ class RecoveryServiceTest {
         assertIs<RecoveryResult.Failure>(result)
         assertEquals(RecoveryStage.NOTIFICATION_SUPPRESSION, result.stage)
     }
+
+    @Test
+    fun testStageListenerEmitsEvents() = runBlocking {
+        val engine = createMockEngine()
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+        val stagesLogged = mutableListOf<String>()
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+            stageListener = { stageKey, _, isSuccess, _ ->
+                stagesLogged.add("$stageKey:$isSuccess")
+            },
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertTrue(stagesLogged.contains("1:true"))
+        assertTrue(stagesLogged.contains("2:true"))
+        assertTrue(stagesLogged.contains("2b:true"))
+        assertTrue(stagesLogged.contains("3:true"))
+        assertTrue(stagesLogged.contains("4:true"))
+        assertTrue(stagesLogged.contains("5:true"))
+        assertTrue(stagesLogged.contains("6:true"))
+        assertTrue(stagesLogged.contains("7:true"))
+        assertTrue(stagesLogged.contains("8:true"))
+        assertTrue(stagesLogged.contains("9:true"))
+    }
 }
