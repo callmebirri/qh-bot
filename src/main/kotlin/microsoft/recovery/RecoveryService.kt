@@ -22,6 +22,10 @@ import io.ktor.http.isSuccess
 import io.ktor.http.parameters
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import microsoft.recovery.alias.AliasClient
 import microsoft.recovery.model.GenerateRecoveryCodeRequest
 import microsoft.recovery.model.GenerateRecoveryCodeResponse
@@ -314,16 +318,28 @@ class RecoveryService(
             },
         )
 
-        val otcData = runCatching { otcResponse.body<GetOneTimeCodeResponse>() }.getOrNull()
-        val postPpft = otcData?.flowToken ?: initialPpft
-        if (postPpft.isBlank()) {
-            val msg = "GetOneTimeCode returned invalid flow token: State=${otcData?.state}, Error=${otcData?.error}"
+        val rawBody = otcResponse.bodyAsText()
+        val jsonResponse = runCatching {
+            MicrosoftHttpClientFactory.json.parseToJsonElement(rawBody).jsonObject
+        }.getOrNull()
+
+        val state = jsonResponse?.get("State")?.jsonPrimitive?.intOrNull
+            ?: jsonResponse?.get("state")?.jsonPrimitive?.intOrNull
+        val flowToken = jsonResponse?.get("FlowToken")?.jsonPrimitive?.contentOrNull
+            ?: jsonResponse?.get("flowToken")?.jsonPrimitive?.contentOrNull
+
+        if (flowToken.isNullOrEmpty()) {
+            val msg = "Fatal: Missing FlowToken in response"
             stageListener?.invoke("2", "OTP Dispatch", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.OTP_DISPATCH, msg, otcData?.state?.toString()))
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.OTP_DISPATCH, msg, state?.toString()))
+        }
+
+        if (state != 204 && state != null) {
+            logger.warn("Microsoft returned State $state (Rate Limited). Proceeding with FlowToken.")
         }
 
         stageListener?.invoke("2", "OTP Dispatch", true, "FlowToken received")
-        return StageExecution.Success(postPpft)
+        return StageExecution.Success(flowToken)
     }
 
     private suspend fun executeStage2b(

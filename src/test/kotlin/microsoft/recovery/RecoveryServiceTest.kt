@@ -23,6 +23,7 @@ class RecoveryServiceTest {
         ifExistsResult: Int = 0,
         failAtNotification: Boolean = false,
         otcState: Int = 201,
+        otcFlowToken: String? = "MOCK_NEW_PPFT_456",
         returnAuthCookie: Boolean = true,
         includeTokenT: Boolean = true,
     ): MockEngine {
@@ -85,13 +86,9 @@ class RecoveryServiceTest {
                 }
 
                 path == "/GetOneTimeCode.srf" -> {
+                    val flowTokenField = if (otcFlowToken != null) """, "FlowToken": "$otcFlowToken"""" else ""
                     respond(
-                        content = """
-                            {
-                                "State": $otcState,
-                                "FlowToken": "MOCK_NEW_PPFT_456"
-                            }
-                        """.trimIndent(),
+                        content = """{"State": $otcState$flowTokenField}""",
                         status = HttpStatusCode.OK,
                         headers = headersOf(HttpHeaders.ContentType, "application/json"),
                     )
@@ -383,5 +380,37 @@ class RecoveryServiceTest {
         assertTrue(stagesLogged.contains("7:true"))
         assertTrue(stagesLogged.contains("8:true"))
         assertTrue(stagesLogged.contains("9:true"))
+    }
+
+    @Test
+    fun testStage2State206ProceedsWithFlowToken(): Unit = runBlocking {
+        val engine = createMockEngine(otcState = 206)
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+    }
+
+    @Test
+    fun testStage2MissingFlowTokenFails(): Unit = runBlocking {
+        val engine = createMockEngine(otcState = 201, otcFlowToken = null)
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Failure>(result)
+        assertEquals(RecoveryStage.OTP_DISPATCH, result.stage)
+        assertEquals("Fatal: Missing FlowToken in response", result.message)
     }
 }
