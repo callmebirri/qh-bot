@@ -126,6 +126,7 @@ class RecoveryInteractionEvent(
                                         originalEmail = email,
                                         newEmail = result.newPrimaryEmail,
                                         password = result.password,
+                                        recoveryCode = result.finalRecoveryCode,
                                     )
                                 }
 
