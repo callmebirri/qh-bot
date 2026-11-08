@@ -30,16 +30,21 @@ jobs:
       - name: Build Shadow JAR
         run: ./gradlew shadowJar --no-daemon
 
+      - name: Prepare runtime directory
+        run: |
+          cp config.properties build/libs/
+          mkdir -p build/libs/logs build/libs/data
+
       - name: Run Bot with 10-minute timeout
         env:
           DBT: ${{ secrets.DBT }}
           SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
         run: |
-          mkdir -p logs data
+          cd build/libs
           echo "Starting bot with 10-minute timeout..."
           
           set +e
-          timeout -s TERM -k 15s 10m java -jar build/libs/qh-bot-1.0-SNAPSHOT.jar
+          timeout -s TERM -k 15s 10m java -jar qh-bot-1.0-SNAPSHOT.jar
           EXIT_CODE=$?
           set -e
 
