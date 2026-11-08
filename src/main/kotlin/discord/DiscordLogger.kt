@@ -82,7 +82,7 @@ Recovery: ${recoveryCode ?: "N/A"}
                     color = redColor
                     field("IGN", true) { ign }
                     field("Email gốc", true) { originalEmail }
-                    field("Lý do lỗi", false) { errorReason ?: "Lỗi không xác định" }
+                    field("Lý do lỗi", false) { (errorReason ?: "Lỗi không xác định").take(1020) }
                 }
             }
         } catch (e: Exception) {

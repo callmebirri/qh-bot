@@ -4,6 +4,8 @@ import database.DatabaseManager
 import database.repository.SqliteAccountRepository
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
+import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
@@ -28,6 +30,8 @@ class RecoveryServiceTest {
         includeTokenT: Boolean = true,
         returnPpftOnPolish: Boolean = false,
         redirectPolish: Boolean = false,
+        onStage3Request: ((io.ktor.client.request.HttpRequestData) -> Unit)? = null,
+        extraCookies: Boolean = false,
     ): MockEngine {
         var manageAdditionalCalls = 0
 
@@ -35,6 +39,7 @@ class RecoveryServiceTest {
             val path = request.url.encodedPath
             when {
                 path == "/login.srf" && request.url.parameters.contains("wreply") -> {
+                    onStage3Request?.invoke(request)
                     if (redirectPolish) {
                         respond("", HttpStatusCode.Found, headersOf(HttpHeaders.Location, "/login_redirect.srf"))
                     } else if (returnPpftOnPolish) {
@@ -71,6 +76,14 @@ class RecoveryServiceTest {
                 }
 
                 path == "/login.srf" -> {
+                    val headers = if (extraCookies) {
+                        headersOf(
+                            HttpHeaders.ContentType to listOf("text/html"),
+                            HttpHeaders.SetCookie to listOf("uaid=server_uaid_9999; Domain=login.live.com; Path=/"),
+                        )
+                    } else {
+                        headersOf(HttpHeaders.ContentType, "text/html")
+                    }
                     respond(
                         content = """
                             <html>
@@ -80,7 +93,7 @@ class RecoveryServiceTest {
                             </html>
                         """.trimIndent(),
                         status = HttpStatusCode.OK,
-                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                        headers = headers,
                     )
                 }
 
@@ -89,6 +102,14 @@ class RecoveryServiceTest {
                         """[{"data":"proof_data_xyz","display":"user@example.com","type":1}]"""
                     } else {
                         "[]"
+                    }
+                    val headers = if (extraCookies) {
+                        headersOf(
+                            HttpHeaders.ContentType to listOf("application/json"),
+                            HttpHeaders.SetCookie to listOf("OParams=legacy_oparams_val; Domain=login.live.com; Path=/"),
+                        )
+                    } else {
+                        headersOf(HttpHeaders.ContentType, "application/json")
                     }
                     respond(
                         content = """
@@ -101,16 +122,24 @@ class RecoveryServiceTest {
                             }
                         """.trimIndent(),
                         status = HttpStatusCode.OK,
-                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                        headers = headers,
                     )
                 }
 
                 path == "/GetOneTimeCode.srf" -> {
                     val flowTokenField = if (otcFlowToken != null) """, "FlowToken": "$otcFlowToken"""" else ""
+                    val headers = if (extraCookies) {
+                        headersOf(
+                            HttpHeaders.ContentType to listOf("application/json"),
+                            HttpHeaders.SetCookie to listOf("PPState=legacy_ppstate_val; Domain=login.live.com; Path=/"),
+                        )
+                    } else {
+                        headersOf(HttpHeaders.ContentType, "application/json")
+                    }
                     respond(
                         content = """{"State": $otcState$flowTokenField}""",
                         status = HttpStatusCode.OK,
-                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                        headers = headers,
                     )
                 }
 
@@ -288,6 +317,9 @@ class RecoveryServiceTest {
             newEmail = "administrator2026@outlook.com",
         )
 
+        if (result is RecoveryResult.Failure) {
+            println("FAILURE STAGE: ${result.stage}, MESSAGE: ${result.message}")
+        }
         assertIs<RecoveryResult.Success>(result)
         assertEquals("victim@example.com", result.originalEmail)
         assertEquals("administrator2026@outlook.com", result.newPrimaryEmail)
@@ -389,6 +421,9 @@ class RecoveryServiceTest {
             },
         )
 
+        if (result is RecoveryResult.Failure) {
+            println("FAILURE STAGE: ${result.stage}, MESSAGE: ${result.message}")
+        }
         assertIs<RecoveryResult.Success>(result)
         assertTrue(stagesLogged.contains("1:true"))
         assertTrue(stagesLogged.contains("2:true"))
@@ -414,6 +449,9 @@ class RecoveryServiceTest {
             newEmail = "admin@outlook.com",
         )
 
+        if (result is RecoveryResult.Failure) {
+            println("FAILURE STAGE: ${result.stage}, MESSAGE: ${result.message}")
+        }
         assertIs<RecoveryResult.Success>(result)
     }
 
@@ -481,5 +519,30 @@ class RecoveryServiceTest {
         )
 
         assertIs<RecoveryResult.Success>(result)
+    }
+
+    @Test
+    fun testStage3CookieIsolation(): Unit = runBlocking {
+        var capturedStage3Cookie: String? = null
+        val engine = createMockEngine(
+            extraCookies = true,
+            onStage3Request = { req ->
+                capturedStage3Cookie = req.headers[HttpHeaders.Cookie]
+            },
+        )
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertNotNull(capturedStage3Cookie)
+        assertTrue(capturedStage3Cookie!!.contains("__Host-MSAAUTH=msa_session_cookie_token"))
+        assertTrue(capturedStage3Cookie!!.contains("uaid=server_uaid_9999"))
+        assertTrue(!capturedStage3Cookie!!.contains("OParams"))
+        assertTrue(!capturedStage3Cookie!!.contains("PPState"))
     }
 }

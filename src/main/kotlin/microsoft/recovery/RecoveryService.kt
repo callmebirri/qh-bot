@@ -5,6 +5,8 @@ import database.repository.AccountRepository
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.HttpClientEngine
+import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpRedirect
 import io.ktor.client.plugins.cookies.AcceptAllCookiesStorage
 import io.ktor.client.plugins.cookies.CookiesStorage
 import io.ktor.client.request.forms.submitForm
@@ -130,7 +132,7 @@ class RecoveryService(
         newEmail: String,
         stageListener: StageListener? = null,
     ): RecoveryResult {
-        val uaid = RecoveryParsers.generateUaid()
+        var uaid = RecoveryParsers.generateUaid()
 
         val stage1Result = executeStage1(client, email, stageListener)
         if (stage1Result is StageExecution.Failure) return stage1Result.result
@@ -144,8 +146,19 @@ class RecoveryService(
         val stage2bResult = executeStage2b(client, cookieStorage, email, proofId, postPpft, otp, stageListener)
         if (stage2bResult is StageExecution.Failure) return stage2bResult.result
 
+        val storedUaid = cookieStorage.get(Url("https://login.live.com")).firstOrNull { it.name == "uaid" }?.value
+        if (!storedUaid.isNullOrBlank()) {
+            uaid = storedUaid
+        }
+
         val stage3Result = executeStage3(client, cookieStorage, uaid, stageListener)
         if (stage3Result is StageExecution.Failure) return stage3Result.result
+
+        val postStage3Uaid = cookieStorage.get(Url("https://account.live.com")).firstOrNull { it.name == "uaid" }?.value
+            ?: cookieStorage.get(Url("https://login.live.com")).firstOrNull { it.name == "uaid" }?.value
+        if (!postStage3Uaid.isNullOrBlank()) {
+            uaid = postStage3Uaid
+        }
 
         val stage4Result = executeStage4(client, stageListener)
         if (stage4Result is StageExecution.Failure) return stage4Result.result
@@ -405,23 +418,58 @@ class RecoveryService(
         uaid: String,
         stageListener: StageListener?,
     ): StageExecution<Unit> {
-        var currentUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$uaid&lc=1033&id=38936&mkt=en-US"
-        var polishResponse = client.get(currentUrl)
-        var redirectCount = 0
+        val loginCookies = cookieStorage.get(Url("https://login.live.com"))
+        val currentUaid = loginCookies.firstOrNull { it.name == "uaid" }?.value ?: uaid
+        val msaAuthValue = loginCookies.firstOrNull { it.name == "__Host-MSAAUTH" }?.value
+        val amscValue = loginCookies.firstOrNull { it.name == "amsc" }?.value
 
-        while (polishResponse.status.value in 300..399 && redirectCount < 5) {
-            val location = polishResponse.headers[HttpHeaders.Location] ?: break
-            currentUrl = URLBuilder(currentUrl).takeFrom(location).buildString()
-            polishResponse = client.get(currentUrl)
-            redirectCount++
+        if (msaAuthValue.isNullOrBlank()) {
+            val msg = "Missing __Host-MSAAUTH cookie for session stabilization"
+            stageListener?.invoke("3", "Session Polish", false, msg)
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+        }
+
+        val cookieParts = mutableListOf("__Host-MSAAUTH=$msaAuthValue", "uaid=$currentUaid")
+        if (!amscValue.isNullOrBlank()) {
+            cookieParts.add("amsc=$amscValue")
+        }
+        val cleanCookieHeader = cookieParts.joinToString("; ")
+
+        val stabilizationUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$currentUaid&lc=1033&id=38936&mkt=en-US"
+
+        val isolatedClient = if (clientEngine != null) {
+            HttpClient(clientEngine) {
+                followRedirects = true
+                install(HttpRedirect) { checkHttpMethod = false }
+            }
+        } else {
+            HttpClient(OkHttp.create()) {
+                followRedirects = true
+                install(HttpRedirect) { checkHttpMethod = false }
+            }
+        }
+
+        val polishResponse = isolatedClient.use {
+            it.get(stabilizationUrl) {
+                header(HttpHeaders.Cookie, cleanCookieHeader)
+                header(
+                    HttpHeaders.UserAgent,
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                )
+                header(
+                    HttpHeaders.Accept,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+            }
         }
 
         val responseBodyString = polishResponse.bodyAsText()
+        val hasPpft = responseBodyString.contains("name=\"PPFT\"")
         val document = Jsoup.parse(responseBodyString)
         val tokenT = document.selectFirst("input[name=t]")?.attr("value")
 
         if (tokenT.isNullOrBlank()) {
-            if (responseBodyString.contains("name=\"PPFT\"")) {
+            if (hasPpft) {
                 val msg = "Session expired or invalid, asked to login again."
                 stageListener?.invoke("3", "Session Polish", false, msg)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
