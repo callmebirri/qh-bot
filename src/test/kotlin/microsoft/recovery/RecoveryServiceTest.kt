@@ -1,5 +1,7 @@
 package microsoft.recovery
 
+import database.DatabaseManager
+import database.repository.SqliteAccountRepository
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
 import io.ktor.http.HttpHeaders
@@ -8,9 +10,12 @@ import io.ktor.http.headersOf
 import kotlinx.coroutines.runBlocking
 import microsoft.recovery.model.RecoveryResult
 import microsoft.recovery.model.RecoveryStage
+import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 class RecoveryServiceTest {
 
@@ -248,14 +253,21 @@ class RecoveryServiceTest {
     }
 
     @Test
-    fun testCompleteLifecycleSuccess() = runBlocking {
+    fun testCompleteLifecycleSuccess(): Unit = runBlocking {
         val engine = createMockEngine()
-        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+        val tempDb = File.createTempFile("test_recov_", ".db")
+        val dbManager = DatabaseManager(tempDb.absolutePath)
+        val repository = SqliteAccountRepository(dbManager)
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            accountRepository = repository,
+        )
 
         val result = service.runLifecycle(
             email = "victim@example.com",
             otpProvider = { "123456" },
-            newPassword = "NewSecretPassword123!",
             newEmail = "administrator2026@outlook.com",
         )
 
@@ -265,6 +277,17 @@ class RecoveryServiceTest {
         assertEquals("INITIAL-RECOV-11111-22222-33333", result.initialRecoveryCode)
         assertEquals("FINAL-RECOV-44444-55555-66666", result.finalRecoveryCode)
         assertEquals(2, result.suppressedProofsCount)
+        assertTrue(result.password.isNotEmpty())
+        assertTrue(result.password.length in 12..16)
+
+        val saved = repository.getAccountByEmail("victim@example.com")
+        assertNotNull(saved)
+        assertEquals(result.password, saved.password)
+        assertEquals("FINAL-RECOV-44444-55555-66666", saved.recoveryCode)
+        assertEquals("administrator2026@outlook.com", saved.currentPrimaryEmail)
+
+        dbManager.close()
+        tempDb.delete()
     }
 
     @Test

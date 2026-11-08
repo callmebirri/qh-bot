@@ -17,6 +17,25 @@ class RecoveryParsersTest {
     }
 
     @Test
+    fun testGenerateRandomPassword() {
+        val password = RecoveryParsers.generateRandomPassword(14)
+        assertEquals(14, password.length)
+        assertTrue(password.any { it.isUpperCase() })
+        assertTrue(password.any { it.isLowerCase() })
+        assertTrue(password.any { it.isDigit() })
+        assertTrue(password.any { it in "!@#$%^&*" })
+
+        for (len in 12..16) {
+            val pass = RecoveryParsers.generateRandomPassword(len)
+            assertEquals(len, pass.length)
+            assertTrue(pass.any { it.isUpperCase() })
+            assertTrue(pass.any { it.isLowerCase() })
+            assertTrue(pass.any { it.isDigit() })
+            assertTrue(pass.any { it in "!@#$%^&*" })
+        }
+    }
+
+    @Test
     fun testUnescapeUnicode() {
         val input = "foo\\u002bbar\\u003abaz"
         val output = RecoveryParsers.unescapeUnicode(input)

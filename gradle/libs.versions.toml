@@ -6,6 +6,8 @@ kcorou = "1.11.0"
 ktor = "3.6.1"
 logback = "1.6.6"
 jsoup = "1.24.1"
+sqlite = "3.54.1.0"
+hikaricp = "7.1.0"
 
 [libraries]
 koin-core = { module = "io.insert-koin:koin-core", version.ref = "koin" }
@@ -19,3 +21,5 @@ ktor-serialization-kotlinx-json = { module = "io.ktor:ktor-serialization-kotlinx
 ktor-client-mock = { module = "io.ktor:ktor-client-mock", version.ref = "ktor" }
 logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
 jsoup = { module = "org.jsoup:jsoup", version.ref = "jsoup" }
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqlite" }
+hikaricp = { module = "com.zaxxer:HikariCP", version.ref = "hikaricp" }

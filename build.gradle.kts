@@ -26,6 +26,8 @@ dependencies {
     implementation(libs.ktor.serialization.kotlinx.json)
     implementation(libs.logback.classic)
     implementation(libs.jsoup)
+    implementation(libs.sqlite.jdbc)
+    implementation(libs.hikaricp)
 }
 
 kotlin {

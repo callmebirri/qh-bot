@@ -30,6 +30,28 @@ object RecoveryParsers {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
+    fun generateRandomPassword(length: Int = 14): String {
+        val upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        val lower = "abcdefghijklmnopqrstuvwxyz"
+        val digits = "0123456789"
+        val specials = "!@#$%^&*"
+        val all = upper + lower + digits + specials
+
+        val chars = mutableListOf(
+            upper[secureRandom.nextInt(upper.length)],
+            lower[secureRandom.nextInt(lower.length)],
+            digits[secureRandom.nextInt(digits.length)],
+            specials[secureRandom.nextInt(specials.length)],
+        )
+
+        for (i in 4 until length) {
+            chars.add(all[secureRandom.nextInt(all.length)])
+        }
+
+        chars.shuffle(secureRandom)
+        return chars.joinToString("")
+    }
+
     fun unescapeUnicode(input: String): String = unicodeRegex.replace(input) { matchResult ->
         matchResult.groupValues[1].toInt(16).toChar().toString()
     }

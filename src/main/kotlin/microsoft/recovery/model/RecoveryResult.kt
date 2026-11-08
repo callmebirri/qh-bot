@@ -4,6 +4,7 @@ sealed class RecoveryResult {
     data class Success(
         val originalEmail: String,
         val newPrimaryEmail: String,
+        val password: String = "",
         val initialRecoveryCode: String,
         val finalRecoveryCode: String,
         val suppressedProofsCount: Int,
