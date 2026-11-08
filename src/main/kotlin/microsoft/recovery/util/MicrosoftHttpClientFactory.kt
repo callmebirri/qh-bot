@@ -3,6 +3,7 @@ package microsoft.recovery.util
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpRedirect
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.cookies.AcceptAllCookiesStorage
@@ -25,6 +26,10 @@ object MicrosoftHttpClientFactory {
         storage: CookiesStorage = AcceptAllCookiesStorage(),
         engine: HttpClientEngine = OkHttp.create(),
     ): HttpClient = HttpClient(engine) {
+        followRedirects = true
+        install(HttpRedirect) {
+            checkHttpMethod = false
+        }
         install(HttpCookies) {
             this.storage = storage
         }

@@ -26,6 +26,8 @@ class RecoveryServiceTest {
         otcFlowToken: String? = "MOCK_NEW_PPFT_456",
         returnAuthCookie: Boolean = true,
         includeTokenT: Boolean = true,
+        returnPpftOnPolish: Boolean = false,
+        redirectPolish: Boolean = false,
     ): MockEngine {
         var manageAdditionalCalls = 0
 
@@ -33,7 +35,11 @@ class RecoveryServiceTest {
             val path = request.url.encodedPath
             when {
                 path == "/login.srf" && request.url.parameters.contains("wreply") -> {
-                    if (!includeTokenT) {
+                    if (redirectPolish) {
+                        respond("", HttpStatusCode.Found, headersOf(HttpHeaders.Location, "/login_redirect.srf"))
+                    } else if (returnPpftOnPolish) {
+                        respond("<html><form><input type=\"hidden\" name=\"PPFT\" value=\"expired\"/></form></html>", HttpStatusCode.OK)
+                    } else if (!includeTokenT) {
                         respond("<html><body>No token here</body></html>", HttpStatusCode.OK)
                     } else {
                         respond(
@@ -48,6 +54,20 @@ class RecoveryServiceTest {
                             headers = headersOf(HttpHeaders.ContentType, "text/html"),
                         )
                     }
+                }
+
+                path == "/login_redirect.srf" -> {
+                    respond(
+                        content = """
+                            <html>
+                            <form>
+                            <input type="hidden" name="t" value="SAMPLE_TOKEN_T_VALUE_1024"/>
+                            </form>
+                            </html>
+                        """.trimIndent(),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
                 }
 
                 path == "/login.srf" -> {
@@ -412,5 +432,54 @@ class RecoveryServiceTest {
         assertIs<RecoveryResult.Failure>(result)
         assertEquals(RecoveryStage.OTP_DISPATCH, result.stage)
         assertEquals("Fatal: Missing FlowToken in response", result.message)
+    }
+
+    @Test
+    fun testStage3SessionExpiredDetectsPpft(): Unit = runBlocking {
+        val engine = createMockEngine(returnPpftOnPolish = true)
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Failure>(result)
+        assertEquals(RecoveryStage.SESSION_POLISH, result.stage)
+        assertEquals("Session expired or invalid, asked to login again.", result.message)
+    }
+
+    @Test
+    fun testStage3MissingTokenT(): Unit = runBlocking {
+        val engine = createMockEngine(includeTokenT = false)
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Failure>(result)
+        assertEquals(RecoveryStage.SESSION_POLISH, result.stage)
+        assertEquals("Token t not found in HTML.", result.message)
+    }
+
+    @Test
+    fun testStage3RedirectFollowed(): Unit = runBlocking {
+        val engine = createMockEngine(redirectPolish = true)
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Success>(result)
     }
 }

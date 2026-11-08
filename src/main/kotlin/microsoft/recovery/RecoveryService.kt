@@ -16,10 +16,12 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.Cookie
 import io.ktor.http.HttpHeaders
+import io.ktor.http.URLBuilder
 import io.ktor.http.Url
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import io.ktor.http.parameters
+import io.ktor.http.takeFrom
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.contentOrNull
@@ -47,6 +49,7 @@ import microsoft.recovery.model.VerifyRecoveryCodeRequest
 import microsoft.recovery.model.VerifyRecoveryCodeResponse
 import microsoft.recovery.util.MicrosoftHttpClientFactory
 import microsoft.recovery.util.RecoveryParsers
+import org.jsoup.Jsoup
 import org.slf4j.LoggerFactory
 import java.security.SecureRandom
 
@@ -384,6 +387,10 @@ class RecoveryService(
         }
 
         cookieStorage.addCookie(
+            Url("https://login.live.com"),
+            Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "login.live.com", path = "/", secure = true),
+        )
+        cookieStorage.addCookie(
             Url("https://account.live.com"),
             Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "account.live.com", path = "/", secure = true),
         )
@@ -398,31 +405,65 @@ class RecoveryService(
         uaid: String,
         stageListener: StageListener?,
     ): StageExecution<Unit> {
-        val polishUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$uaid&lc=1033&id=38936&mkt=en-US"
-        val polishResponse = client.get(polishUrl)
-        val polishHtml = polishResponse.bodyAsText()
-        val tokenT = RecoveryParsers.extractTokenT(polishHtml)
-            ?: run {
-                val msg = "Failed to extract token t from session stabilization step"
+        var currentUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$uaid&lc=1033&id=38936&mkt=en-US"
+        var polishResponse = client.get(currentUrl)
+        var redirectCount = 0
+
+        while (polishResponse.status.value in 300..399 && redirectCount < 5) {
+            val location = polishResponse.headers[HttpHeaders.Location] ?: break
+            currentUrl = URLBuilder(currentUrl).takeFrom(location).buildString()
+            polishResponse = client.get(currentUrl)
+            redirectCount++
+        }
+
+        val responseBodyString = polishResponse.bodyAsText()
+        val document = Jsoup.parse(responseBodyString)
+        val tokenT = document.selectFirst("input[name=t]")?.attr("value")
+
+        if (tokenT.isNullOrBlank()) {
+            if (responseBodyString.contains("name=\"PPFT\"")) {
+                val msg = "Session expired or invalid, asked to login again."
                 stageListener?.invoke("3", "Session Polish", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_STABILIZATION, msg))
+                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
             }
+            val msg = "Token t not found in HTML."
+            stageListener?.invoke("3", "Session Polish", false, msg)
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+        }
 
         val addProofResponse = client.submitForm(
             url = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
             formParameters = parameters { append("t", tokenT) },
         )
 
+        val setCookieHeaders = addProofResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()
+        for (rawCookie in setCookieHeaders) {
+            if (rawCookie.contains("AMRPSSecAuth=")) {
+                val value = rawCookie.substringAfter("AMRPSSecAuth=").substringBefore(";")
+                cookieStorage.addCookie(
+                    Url("https://account.live.com"),
+                    Cookie(name = "AMRPSSecAuth", value = value, domain = "account.live.com", path = "/", secure = true),
+                )
+            }
+            if (rawCookie.contains("amsc=")) {
+                val value = rawCookie.substringAfter("amsc=").substringBefore(";")
+                cookieStorage.addCookie(
+                    Url("https://account.live.com"),
+                    Cookie(name = "amsc", value = value, domain = "account.live.com", path = "/", secure = true),
+                )
+            }
+        }
+
         val accountCookies = cookieStorage.get(Url("https://account.live.com"))
         val hasAmrp = accountCookies.any { it.name == "AMRPSSecAuth" }
-            || addProofResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty().any { it.contains("AMRPSSecAuth") }
+            || setCookieHeaders.any { it.contains("AMRPSSecAuth") }
         val hasAmsc = accountCookies.any { it.name == "amsc" }
-            || addProofResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty().any { it.contains("amsc") }
+            || setCookieHeaders.any { it.contains("amsc") }
 
         if (!hasAmrp || !hasAmsc) {
             val msg = "Missing AMRPSSecAuth or amsc cookies after session stabilization"
             stageListener?.invoke("3", "Session Polish", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_STABILIZATION, msg))
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
         }
 
         stageListener?.invoke("3", "Session Polish", true, "AMRPSSecAuth received")
