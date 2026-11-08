@@ -1,0 +1,56 @@
+name: Run Bot on Main
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build Shadow JAR
+        run: ./gradlew shadowJar --no-daemon
+
+      - name: Run Bot with 10-minute timeout
+        env:
+          DBT: ${{ secrets.DBT }}
+          SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
+        run: |
+          mkdir -p logs data
+          echo "Starting bot with 10-minute timeout..."
+          
+          set +e
+          timeout -s TERM -k 15s 10m java -jar build/libs/qh-bot-1.0-SNAPSHOT.jar
+          EXIT_CODE=$?
+          set -e
+
+          echo "Process exited with code: $EXIT_CODE"
+
+          # Exit code 124 means timeout terminated the command normally after 10 minutes
+          # Exit code 143 (128 + 15) means SIGTERM was handled on termination
+          if [ "$EXIT_CODE" -eq 124 ] || [ "$EXIT_CODE" -eq 143 ] || [ "$EXIT_CODE" -eq 0 ]; then
+            echo "Bot run completed successfully (terminated after 10 minutes or completed cleanly)."
+            exit 0
+          else
+            echo "Bot failed unexpectedly with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
