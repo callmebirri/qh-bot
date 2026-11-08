@@ -1,0 +1,177 @@
+# Task: Implement Microsoft Account Recovery & Security Maintenance Flow in Kotlin
+
+## Context
+I am porting a legacy Node.js utility to Kotlin. The utility automates Microsoft Account recovery and security maintenance tasks: credential discovery, OTP validation, session stabilization, recovery code management, password reset, notification preference updates, alias rotation, and session cleanup.
+
+I have already tested the entire flow manually with curl against a sandbox account and confirmed which stages work. This prompt is based on that verified knowledge. Do NOT rely on generic assumptions or old audits.
+
+The module will eventually be called from a Kord Discord bot, but it must be Discord-agnostic and expose a suspend fun API.
+
+## Tech stack
+- Kotlin (JVM 17+), coroutines
+- Ktor Client (OkHttp engine) for HTTP
+- kotlinx.serialization for JSON
+- jsoup for HTML parsing (do NOT use raw regex where jsoup can do it)
+- Add whatever Gradle dependencies you need (recent stable versions)
+
+## Verified flow (tested and working)
+
+The following stages have been tested end-to-end with curl and are confirmed working:
+
+### Stage 1 — Credential discovery
+- GET https://login.live.com/login.srf with Chrome User-Agent and cookie jar.
+- The flow token (PPFT) is NOT in `<input name="PPFT">` directly. It lives inside the JSON string of `var ServerData = ({...,"sFTAg":"<input type=\"hidden\" name=\"PPFT\" id=\"...\" value=\"...\">",...});`
+- Quotes are escaped as `\"` inside the JSON string.
+- Correct extraction: parse ServerData JSON first, then regex `value=\\?"([^"\\]+)` on sFTAg.
+- POST https://login.live.com/GetCredentialType.srf with JSON body:
+  {username, flowToken: PPFT, isUcuxLoginForm: true, isCookieBannerShown: false, checkPhones: true}
+- Response fields: IfExistsResult (0=exists, 1=not found, 5=throttled), Credentials.HasPassword, Credentials.OtcLoginEligibleProofs[].data (proofId), Credentials.RemoteNGCParams
+
+### Stage 2 — OTP dispatch and session establishment
+- POST https://login.live.com/GetOneTimeCode.srf (form-urlencoded) with:
+  login, flowtoken=PPFT, purpose=eOTT_OtcLogin, channel=Email, AltEmailE=proofId
+- Response: {State: 204, FlowToken: <new flow token>}
+- Then POST https://login.live.com/ppsecure/post.srf with:
+  login, loginfmt, type=27, SentProofIDE=proofId, otc=<user OTP>, PPFT=<new FlowToken>, LoginOptions=3
+- On success (or even on 200 with interstitial): cookie __Host-MSAAUTH is set in the jar. This is the master session cookie.
+- IMPORTANT: PPFT is single-use. Re-fetch login.srf before every GetCredentialType call.
+
+### Stage 3 — Session stabilization (gets AMRPSSecAuth + amsc)
+- GET https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=<uaid>&lc=1033&id=38936&mkt=en-US
+  with Cookie: __Host-MSAAUTH=<session>
+- Response HTML contains `<input name="t" value="...">` (a ~1024-char token).
+- POST https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0 with body t=<token>
+- Response sets cookies AMRPSSecAuth (on .account.live.com) and amsc (on .live.com). These are REQUIRED for all subsequent account.live.com/API/* calls.
+
+### Stage 4 — Security info enumeration
+- GET https://account.live.com/proofs/manage/additional with AMRPSSecAuth + amsc cookies.
+- Response HTML contains `var t0=` followed by a JSON object with WLXAccount.manageProofs.
+- Extract: encryptedNetId (needed for recovery code generation), apiCanary (needed as `canary` header), emailProofs[] and smsProofs[] (proofId + displayProofId).
+- CRITICAL: Tokens in this HTML are Unicode-escaped (\u002b = +, \u002f = /, \u003a = :). You MUST decode them before sending to the API, or the API returns 500. kotlinx.serialization handles this automatically when you parse the JSON properly. Do NOT extract via regex and send raw — that fails.
+
+### Stage 5 — Recovery code generation
+- POST https://account.live.com/API/Proofs/GenerateRecoveryCode
+  Headers: canary: <decoded apiCanary>, Content-Type: application/json, x-ms-apiVersion: 2, x-ms-apiTransport: xhr, X-Requested-With: XMLHttpRequest
+  Body: {"encryptedNetId": "<decoded encryptedNetId>"}
+  Cookies: AMRPSSecAuth, amsc
+- Response: {"recoveryCode": "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX", "apiCanary": "<new canary>"}
+
+### Stage 6 — Password reset via recovery code
+- GET https://account.live.com/ResetPassword.aspx?wreply=https://login.live.com/oauth20_authorize.srf&mn=<email>
+  No session cookie required — this is a public page.
+- Response HTML contains `var ServerData` with sRecoveryToken and apiCanary (both Unicode-escaped). Extract and decode both, plus the amsc cookie.
+- POST https://account.live.com/API/Recovery/VerifyRecoveryCode
+  Headers: canary: <decoded apiCanary>, Content-Type: application/json; charset=utf-8
+  Body: {publicKey: "2CBB3761027476727BDDBC9DE02870BE01ED793A", recoveryCode: "<code>", code: "<code>", scid: 100103, token: "<decoded sRecoveryToken>", uiflvr: 1001}
+- Response: {"token": "<long verification grant token>", "apiCanary": "<new canary>"}
+- POST https://account.live.com/API/Recovery/RecoverUser
+  Headers: canary: <new canary from previous response>, Content-Type: application/json
+  Body: {contactEmail: "<new email>", contactEpid: "", password: "<new password>", passwordExpiryEnabled: 0, publicKey: "2CBB3761027476727BDDBC9DE02870BE01ED793A", token: "<verification grant token>"}
+- Response: {"recoveryCode": "<new 25-char recovery code>", "apiCanary": "<new canary>", "contactEmail": "<email>", "enableTfa": true}
+- Password is now changed. Recovery code differs from before.
+
+### Stage 7 — Notification preference update (CRITICAL before mutating)
+- First, re-fetch proofs/manage/additional to get FRESH encryptedNetId + apiCanary + proofs list.
+- For each emailProof and smsProof, POST https://account.live.com/API/Proofs/SetUserNotificationState
+  Headers: canary: <apiCanary>, Content-Type: application/json
+  Body: {"proofDetails": [{"name": "<displayProofId>", "notificationEnabled": false, "type": "Email"}], "uiflvr": 1001, "uaid": "<dynamic 32-char hex>", "scid": 100109, "hpgid": 201030}
+- Response: {"apiCanary": "<updated canary>"} — MUST use the new canary for the next call.
+- If any call fails, THROW — do NOT continue silently (otherwise Microsoft emails the account owner with security alerts).
+
+### Stage 8 — Alias rotation
+- POST https://account.live.com/AddAssocId (form-urlencoded)
+  Cookies: AMRPSSecAuth, amsc
+  Body: canary=<canary>, PostOption=NONE, SingleDomain=outlook.com, UpSell=, AddAssocIdOptions=LIVE, AssociatedIdLive=<new_alias_prefix>
+- The new alias is created. Response is HTML (200 or 302).
+- GET https://account.live.com/names/manage to fetch fresh canary + current aliases. Extract canary from `<input id="canary">`.
+- POST https://account.live.com/API/MakePrimary (JSON)
+  Headers: canary: <fresh canary>, Content-Type: application/json
+  Body: {"aliasName": "<new_email>@outlook.com", "emailChecked": true, "removeOldPrimary": false, "uiflvr": 1001, "uaid": "<dynamic>", "scid": 100115, "hpgid": 200650}
+- Handle error codes: 1282 (rate limited, weekly quota), 1178 (policy rejection), 500 (transient).
+- POST https://account.live.com/names/manage (form-urlencoded)
+  Body: canary=<fresh canary>, action=RemoveAlias, aliasName=<old_email>, displayName=<old_email>
+- Success signal: response HTML contains "Note_AssociatedIdRemoved".
+
+### Stage 9 — Cleanup
+All POST JSON with `canary` header, AMRPSSecAuth + amsc cookies:
+- POST https://account.live.com/API/Proofs/DisableTfa
+  Body: {"uiflvr": 1001, "uaid": "<dynamic>", "scid": 100109, "hpgid": 201030}
+- POST https://account.live.com/API/Proofs/DeleteDevices (global session revocation)
+- POST https://account.live.com/API/Proofs/DeleteAppPassword
+- POST https://account.live.com/API/Proofs/RemovePasskey
+  Body: {"passKeyId": "<id>", "uiflvr": 1001, "uaid": "<dynamic>", "scid": 100109, "hpgid": 201030} (passKeyId comes from proofs/manage/additional response, field passKeys[].id)
+
+## What is NOT verified / out of scope
+
+- Stage 10 — 2FA TOTP reconfiguration via proofs/Add → AddVerifyTotp → EnableTfa. Audit predicted this is broken (regex `dirltr bold` for TOTP secretKey). NOT tested. Leave a TODO comment, do not implement.
+- Minecraft entitlement chain (OAuth Xbox → XSTS → SSID → entitlements/license). Separate module, handled later with MSAL device-code flow. Do NOT include.
+- Any captcha solving (Arkose Labs FunCaptcha).
+
+## Requirements
+
+### Module structure (you decide exact files, but separate concerns)
+- LiveAuthClient — Stage 1, 2, 3
+- ProofsClient — Stage 4, 7, 9
+- RecoveryClient — Stage 5, 6
+- AliasClient — Stage 8
+- Extractor — HTML parsing helpers (PPFT, ServerData, tokens)
+- Constants — public key, scid/hpgid/uiflvr maps, UA string, client IDs
+
+### Behavioral rules
+- Per-account HttpClient with cookie jar (AcceptAllCookiesStorage). One client per session.
+- expectSuccess = false on Ktor. Handle status codes explicitly. Return typed results (Success<T>, Failure(reason, httpStatus, bodySnippet)).
+- Realistic Chrome UA on every request. Accept: text/html for GET, application/json for JSON POSTs.
+- **Unicode handling**: Always decode tokens from ServerData before using them. Use kotlinx.serialization to parse JSON blobs — it decodes \uXXXX automatically. NEVER send raw extracted strings with \u002b still present.
+- **PPFT single-use**: Re-fetch login.srf before every GetCredentialType and GetOneTimeCode call.
+- **Canary rotation**: Every response from account.live.com/API/* returns a new apiCanary. Use the new one for the next call. Do not reuse.
+- **Dynamic UAID**: Generate a random 32-char hex UUID per session, use it in uaid fields of API bodies. Do NOT hardcode UAIDs from the old source.
+- **Fail-closed for Stage 7 (notification preference update)**: If SetUserNotificationState fails for ANY proof, abort the entire flow and report the error. Do NOT continue to Stage 8/9 if this step failed.
+- **Sequential execution**: All state-changing calls (Stage 7, 8, 9) run SEQUENTIALLY with small delays (500-1000ms between steps). No Promise.all equivalent. This avoids canary conflicts and race conditions.
+- Retry policy: retry GET with 5xx up to 2 times with backoff. Do NOT retry POSTs.
+- Timeout: connect 10s, request 30s, socket 30s.
+
+### Error handling specifics
+- IfExistsResult: 0 proceed, 1 = account not found (throw NotFound), 5 = throttled (throw RateLimited).
+- MakePrimary error 1282 → throw AliasRateLimited (weekly quota, do NOT retry).
+- MakePrimary error 1178 → throw AliasPolicyRejected.
+- RecoverUser error 6001 → throw TfaBlockingReset (2FA must be disabled manually).
+- RecoverUser error 1218 → throw SamePasswordRejected.
+- RecoverUser error 500 → throw CanaryInvalid (refetch proofs and retry once).
+
+### Testing
+- Use Ktor MockEngine. Mock fixtures for: login.srf HTML (with escaped PPFT), GetCredentialType JSON (with proofs), proofs/manage/additional HTML (with Unicode-escaped tokens), ResetPassword.aspx HTML, VerifyRecoveryCode JSON, RecoverUser JSON.
+- Assert:
+  a) extractPpft correctly decodes \\" escaped quote.
+  b) extractEncryptedNetId correctly decodes \\u002b to +.
+  c) Stage 7 aborts on first proof failure.
+  d) RecoverUser with error 6001 throws TfaBlockingReset.
+- Do NOT hit live Microsoft endpoints in tests.
+- A demo main() that takes email + OTP from env vars and runs the full flow: discover → dispatch OTP → submit OTP → polish → security info → generate recovery code → reset password → update notification preferences → rotate alias → cleanup. Print each stage's outcome clearly. This is the manual smoke test.
+
+### Kord integration (leave a clean seam, don't implement)
+Provide a `AccountRecoveryService` class with:
+  suspend fun runRecovery(
+      email: String,
+      otpProvider: suspend () -> String,
+      newPassword: String,
+      newAlias: String,
+      newContactEmail: String
+  ): RecoveryResult
+The Kord handler will call this and pass a lambda that waits for the user's OTP message.
+
+## Out of scope
+- Minecraft ownership check (separate module, MSAL)
+- 2FA TOTP setup (Stage 10, unverified)
+- Captcha solving
+- Discord command registration
+- Persistence / database
+- Multi-account orchestration / rate limiting across accounts
+
+## Definition of done
+- Module compiles with `./gradlew build`.
+- Mocked unit tests pass (with the fixtures listed above).
+- Demo main() can run end-to-end against a sandbox account.
+- No hardcoded UAIDs, no hardcoded secrets, no static credentials.
+- Extractor tests prove escaped-quote and Unicode-decode are handled correctly.
+- KDoc on each public suspend fun explains inputs (especially OTP callback semantics) and lists which error types can be thrown.
+- A README section listing verified stages, unverified stages (Stage 10), and the exact curl commands used to verify each stage (for future re-testing).

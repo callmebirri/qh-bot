@@ -1,6 +1,8 @@
 plugins {
     kotlin("jvm") version "2.4.21"
     kotlin("plugin.serialization") version "2.4.20"
+    application
+    id("com.gradleup.shadow") version "9.6.1"
 }
 
 group = "tech.qhuyy"
@@ -28,6 +30,28 @@ dependencies {
 kotlin {
     jvmToolchain(21)
 }
+
+application {
+    mainClass.set("tech.qhuyy.Main")
+}
+
+tasks.jar {
+    archiveClassifier.set("plain")
+    manifest {
+        attributes["Main-Class"] = "tech.qhuyy.Main"
+    }
+}
+
+tasks.shadowJar {
+    archiveClassifier.set("")
+    manifest {
+        attributes["Main-Class"] = "tech.qhuyy.Main"
+    }
+}
+
+tasks.distZip { dependsOn(tasks.shadowJar) }
+tasks.distTar { dependsOn(tasks.shadowJar) }
+tasks.startScripts { dependsOn(tasks.shadowJar) }
 
 tasks.register<JavaExec>("runDemo") {
     group = "application"

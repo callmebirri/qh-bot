@@ -1,3 +1,6 @@
+@file:JvmName("Main")
+package tech.qhuyy
+
 import command.CommandManager
 import command.commands.PingCommand
 import command.model.CommandInterface
@@ -16,7 +19,7 @@ import org.koin.dsl.module
 
 @OptIn(PrivilegedIntent::class)
 suspend fun main() {
-    val token = requireNotNull(System.getenv("DBT")) { "Discord Bot Token has not been set!" }
+    val token = requireNotNull(System.getenv("DBT")) { "Discord Bot Token has not been found!" }
     val kord = Kord(token)
     val koin = startKoin { modules(kordModule(kord)) }.koin
     koin.get<EventManager>().registerAll()

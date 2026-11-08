@@ -46,6 +46,7 @@ bin/
 *.local
 *.local.properties
 *.log
+logs/
 .ag_buf.txt
 
 # OS
