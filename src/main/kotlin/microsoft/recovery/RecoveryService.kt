@@ -464,18 +464,40 @@ class RecoveryService(
         }
 
         val responseBodyString = polishResponse.bodyAsText()
+        val parsedDoc = Jsoup.parse(responseBodyString)
+        val htmlTitle = parsedDoc.title()
         val hasPpft = responseBodyString.contains("name=\"PPFT\"")
-        val document = Jsoup.parse(responseBodyString)
-        val tokenT = document.selectFirst("input[name=t]")?.attr("value")
+        val htmlSnippet = responseBodyString.take(500).replace("\r", "").replace("\n", " ")
+
+        logger.info("=== STAGE 3 DEBUG ===")
+        logger.info("HTTP Status: {}", polishResponse.status)
+        logger.info("Location Header: {}", polishResponse.headers[HttpHeaders.Location] ?: "none")
+        logger.info("HTML Length: {}", responseBodyString.length)
+        logger.info("HTML Title: {}", htmlTitle)
+        if (hasPpft) {
+            logger.warn("CRITICAL: Response contains PPFT. Microsoft is asking to log in again.")
+        }
+        logger.info("HTML Snippet: {}", htmlSnippet)
+
+        val debugLogDetail = """
+Status: `${polishResponse.status}` | Title: `$htmlTitle` | Length: `${responseBodyString.length}`
+Location: `${polishResponse.headers[HttpHeaders.Location] ?: "none"}` | PPFT: `$hasPpft`
+```html
+$htmlSnippet
+```
+""".trimIndent()
+        stageListener?.invoke("3-debug", "Stage 3 Debug Dump", true, debugLogDetail)
+
+        val tokenT = parsedDoc.selectFirst("input[name=t]")?.attr("value")
 
         if (tokenT.isNullOrBlank()) {
             if (hasPpft) {
                 val msg = "Session expired or invalid, asked to login again."
-                stageListener?.invoke("3", "Session Polish", false, msg)
+                stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
             }
             val msg = "Token t not found in HTML."
-            stageListener?.invoke("3", "Session Polish", false, msg)
+            stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
             return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
         }
 
