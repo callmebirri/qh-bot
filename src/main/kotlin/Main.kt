@@ -1,5 +1,3 @@
-package tech.qhuyy
-
 import command.CommandManager
 import command.commands.PingCommand
 import command.model.CommandInterface

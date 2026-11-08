@@ -2,7 +2,6 @@ package command.commands
 
 import command.model.CommandInterface
 import config.BotPropertiesManager
-import dev.kord.common.entity.Snowflake
 import dev.kord.core.Kord
 import dev.kord.core.behavior.interaction.respondPublic
 import dev.kord.core.behavior.interaction.response.respond

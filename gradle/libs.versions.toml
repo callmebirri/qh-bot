@@ -1,7 +1,19 @@
 [versions]
 koin = "4.2.2"
 kord = "0.18.1"
+kseri = "1.11.0"
+kcorou = "1.11.0"
+ktor = "3.6.1"
+logback = "1.6.6"
 
 [libraries]
 koin-core = { module = "io.insert-koin:koin-core", version.ref = "koin" }
 kord-core = { module = "dev.kord:kord-core", version.ref = "kord" }
+kseri-core = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kseri" }
+kcorou-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kcorou" }
+ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
+ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
+ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
+ktor-serialization-kotlinx-json = { module = "io.ktor:ktor-serialization-kotlinx-json", version.ref = "ktor" }
+ktor-client-mock = { module = "io.ktor:ktor-client-mock", version.ref = "ktor" }
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
