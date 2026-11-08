@@ -4,6 +4,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpRedirect
+import io.ktor.client.plugins.HttpRequestRetry
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.cookies.AcceptAllCookiesStorage
@@ -40,6 +41,9 @@ object MicrosoftHttpClientFactory {
             requestTimeoutMillis = 30000
             connectTimeoutMillis = 15000
             socketTimeoutMillis = 30000
+        }
+        install(HttpRequestRetry) {
+            maxRetries = 0
         }
         defaultRequest {
             header(

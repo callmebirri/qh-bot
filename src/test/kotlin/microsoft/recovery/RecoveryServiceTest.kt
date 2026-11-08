@@ -545,4 +545,22 @@ class RecoveryServiceTest {
         assertTrue(!capturedStage3Cookie!!.contains("OParams"))
         assertTrue(!capturedStage3Cookie!!.contains("PPState"))
     }
+
+    @Test
+    fun testStage1NetworkExceptionGracefulFailure(): Unit = runBlocking {
+        val engine = MockEngine { _ ->
+            throw RuntimeException("Max send count 20 exceeded. Consider increasing the property maxSendCount if more is required.")
+        }
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Failure>(result)
+        assertEquals(RecoveryStage.CREDENTIAL_DISCOVERY, result.stage)
+        assertEquals("Network timeout or Microsoft rate limit hit", result.message)
+    }
 }

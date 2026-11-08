@@ -113,9 +113,14 @@ class RecoveryService(
             throw e
         } catch (e: Exception) {
             logger.error("Unhandled exception during lifecycle automation: {}", e.message, e)
+            val msg = if (e.message?.contains("Max send count", ignoreCase = true) == true) {
+                "Network timeout or Microsoft rate limit hit"
+            } else {
+                "Lifecycle failed with unexpected exception: ${e.message}"
+            }
             RecoveryResult.Failure(
                 stage = RecoveryStage.CREDENTIAL_DISCOVERY,
-                message = "Lifecycle failed with unexpected exception: ${e.message}",
+                message = msg,
                 cause = e,
             )
         } finally {
@@ -239,80 +244,83 @@ class RecoveryService(
         client: HttpClient,
         email: String,
         stageListener: StageListener?,
-    ): StageExecution<Triple<String, String, String>> {
+    ): StageExecution<Triple<String, String, String>> = try {
         val loginResponse = client.get("https://login.live.com/login.srf")
         if (!loginResponse.status.isSuccess()) {
             val msg = "Failed to fetch login page: HTTP ${loginResponse.status.value}"
             stageListener?.invoke("1", "Credential Discovery", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
-        }
-
-        val loginHtml = loginResponse.bodyAsText()
-        val initialPpft = RecoveryParsers.extractPpft(loginHtml, MicrosoftHttpClientFactory.json)
-            ?: run {
+            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
+        } else {
+            val loginHtml = loginResponse.bodyAsText()
+            val initialPpft = RecoveryParsers.extractPpft(loginHtml, MicrosoftHttpClientFactory.json)
+            if (initialPpft == null) {
                 val msg = "Failed to extract initial PPFT from login page"
                 stageListener?.invoke("1", "Credential Discovery", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
-            }
+                StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
+            } else {
+                val credResponse = client.post("https://login.live.com/GetCredentialType.srf") {
+                    contentType(ContentType.Application.Json)
+                    header("Referer", "https://login.live.com/login.srf")
+                    setBody(
+                        GetCredentialTypeRequest(
+                            username = email,
+                            flowToken = initialPpft,
+                            isUcuxLoginForm = true,
+                            isCookieBannerShown = false,
+                            checkPhones = true,
+                        )
+                    )
+                }
 
-        val credResponse = client.post("https://login.live.com/GetCredentialType.srf") {
-            contentType(ContentType.Application.Json)
-            header("Referer", "https://login.live.com/login.srf")
-            setBody(
-                GetCredentialTypeRequest(
-                    username = email,
-                    flowToken = initialPpft,
-                    isUcuxLoginForm = true,
-                    isCookieBannerShown = false,
-                    checkPhones = true,
-                )
-            )
+                if (!credResponse.status.isSuccess()) {
+                    val msg = "Credential check failed: HTTP ${credResponse.status.value}"
+                    stageListener?.invoke("1", "Credential Discovery", false, msg)
+                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
+                } else {
+                    val credData = credResponse.body<GetCredentialTypeResponse>()
+                    when (credData.ifExistsResult) {
+                        0 -> {
+                            val proofs = credData.credentials?.otcLoginEligibleProofs.orEmpty()
+                            val primaryProof = proofs.firstOrNull()
+                            if (primaryProof?.data == null) {
+                                val msg = if (primaryProof == null) {
+                                    "No OTC eligible proofs available for this account"
+                                } else {
+                                    "Primary proof identifier is missing"
+                                }
+                                stageListener?.invoke("1", "Credential Discovery", false, msg)
+                                StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
+                            } else {
+                                stageListener?.invoke("1", "Credential Discovery", true, "IfExistsResult = 0")
+                                val proofChannel = if (primaryProof.type == 2) "SMS" else "Email"
+                                StageExecution.Success(Triple(initialPpft, primaryProof.data, proofChannel))
+                            }
+                        }
+                        1 -> {
+                            val msg = "Account does not exist (IfExistsResult=1)"
+                            stageListener?.invoke("1", "Credential Discovery", false, msg)
+                            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, "1"))
+                        }
+                        5 -> {
+                            val msg = "Account is throttled or captcha blocked (IfExistsResult=5)"
+                            stageListener?.invoke("1", "Credential Discovery", false, msg)
+                            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, "5"))
+                        }
+                        else -> {
+                            val msg = "Unexpected IfExistsResult=${credData.ifExistsResult}"
+                            stageListener?.invoke("1", "Credential Discovery", false, msg)
+                            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, credData.ifExistsResult?.toString()))
+                        }
+                    }
+                }
+            }
         }
-
-        if (!credResponse.status.isSuccess()) {
-            val msg = "Credential check failed: HTTP ${credResponse.status.value}"
-            stageListener?.invoke("1", "Credential Discovery", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
-        }
-
-        val credData = credResponse.body<GetCredentialTypeResponse>()
-        when (credData.ifExistsResult) {
-            0 -> {}
-            1 -> {
-                val msg = "Account does not exist (IfExistsResult=1)"
-                stageListener?.invoke("1", "Credential Discovery", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, "1"))
-            }
-            5 -> {
-                val msg = "Account is throttled or captcha blocked (IfExistsResult=5)"
-                stageListener?.invoke("1", "Credential Discovery", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, "5"))
-            }
-            else -> {
-                val msg = "Unexpected IfExistsResult=${credData.ifExistsResult}"
-                stageListener?.invoke("1", "Credential Discovery", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, credData.ifExistsResult?.toString()))
-            }
-        }
-
-        val proofs = credData.credentials?.otcLoginEligibleProofs.orEmpty()
-        val primaryProof = proofs.firstOrNull()
-            ?: run {
-                val msg = "No OTC eligible proofs available for this account"
-                stageListener?.invoke("1", "Credential Discovery", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
-            }
-
-        val proofId = primaryProof.data
-            ?: run {
-                val msg = "Primary proof identifier is missing"
-                stageListener?.invoke("1", "Credential Discovery", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg))
-            }
-
-        stageListener?.invoke("1", "Credential Discovery", true, "IfExistsResult = 0")
-        val proofChannel = if (primaryProof.type == 2) "SMS" else "Email"
-        return StageExecution.Success(Triple(initialPpft, proofId, proofChannel))
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        val msg = "Network timeout or Microsoft rate limit hit"
+        stageListener?.invoke("1", "Credential Discovery", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, cause = e))
     }
 
     private suspend fun executeStage2(
@@ -322,7 +330,7 @@ class RecoveryService(
         proofId: String,
         proofChannel: String,
         stageListener: StageListener?,
-    ): StageExecution<String> {
+    ): StageExecution<String> = try {
         val otcResponse = client.submitForm(
             url = "https://login.live.com/GetOneTimeCode.srf",
             formParameters = parameters {
@@ -347,15 +355,21 @@ class RecoveryService(
         if (flowToken.isNullOrEmpty()) {
             val msg = "Fatal: Missing FlowToken in response"
             stageListener?.invoke("2", "OTP Dispatch", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.OTP_DISPATCH, msg, state?.toString()))
-        }
+            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.OTP_DISPATCH, msg, state?.toString()))
+        } else {
+            if (state != 204 && state != null) {
+                logger.warn("Microsoft returned State $state (Rate Limited). Proceeding with FlowToken.")
+            }
 
-        if (state != 204 && state != null) {
-            logger.warn("Microsoft returned State $state (Rate Limited). Proceeding with FlowToken.")
+            stageListener?.invoke("2", "OTP Dispatch", true, "FlowToken received")
+            StageExecution.Success(flowToken)
         }
-
-        stageListener?.invoke("2", "OTP Dispatch", true, "FlowToken received")
-        return StageExecution.Success(flowToken)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        val msg = "Network timeout or Microsoft rate limit hit"
+        stageListener?.invoke("2", "OTP Dispatch", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.OTP_DISPATCH, msg, cause = e))
     }
 
     private suspend fun executeStage2b(
@@ -366,50 +380,56 @@ class RecoveryService(
         postPpft: String,
         otp: String,
         stageListener: StageListener?,
-    ): StageExecution<Unit> {
+    ): StageExecution<Unit> = try {
         if (otp.isBlank()) {
             val msg = "Provided OTP code is blank"
             stageListener?.invoke("2b", "OTP Submit", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_ESTABLISHMENT, msg))
-        }
+            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_ESTABLISHMENT, msg))
+        } else {
+            val postResponse = client.submitForm(
+                url = "https://login.live.com/ppsecure/post.srf",
+                formParameters = parameters {
+                    append("login", email)
+                    append("loginfmt", email)
+                    append("type", "27")
+                    append("SentProofIDE", proofId)
+                    append("otc", otp)
+                    append("PPFT", postPpft)
+                    append("LoginOptions", "3")
+                },
+            )
 
-        val postResponse = client.submitForm(
-            url = "https://login.live.com/ppsecure/post.srf",
-            formParameters = parameters {
-                append("login", email)
-                append("loginfmt", email)
-                append("type", "27")
-                append("SentProofIDE", proofId)
-                append("otc", otp)
-                append("PPFT", postPpft)
-                append("LoginOptions", "3")
-            },
-        )
+            val loginCookies = cookieStorage.get(Url("https://login.live.com"))
+            val msaAuthCookie = loginCookies.firstOrNull { it.name == "__Host-MSAAUTH" }
+                ?: postResponse.headers.getAll(HttpHeaders.SetCookie)?.firstOrNull { it.contains("__Host-MSAAUTH") }?.let {
+                    val value = it.substringAfter("__Host-MSAAUTH=").substringBefore(";")
+                    Cookie(name = "__Host-MSAAUTH", value = value, domain = "login.live.com", path = "/", secure = true)
+                }
 
-        val loginCookies = cookieStorage.get(Url("https://login.live.com"))
-        val msaAuthCookie = loginCookies.firstOrNull { it.name == "__Host-MSAAUTH" }
-            ?: postResponse.headers.getAll(HttpHeaders.SetCookie)?.firstOrNull { it.contains("__Host-MSAAUTH") }?.let {
-                val value = it.substringAfter("__Host-MSAAUTH=").substringBefore(";")
-                Cookie(name = "__Host-MSAAUTH", value = value, domain = "login.live.com", path = "/", secure = true)
+            if (msaAuthCookie == null) {
+                val msg = "Failed to establish authenticated session: __Host-MSAAUTH cookie not found"
+                stageListener?.invoke("2b", "OTP Submit", false, msg)
+                StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_ESTABLISHMENT, msg))
+            } else {
+                cookieStorage.addCookie(
+                    Url("https://login.live.com"),
+                    Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "login.live.com", path = "/", secure = true),
+                )
+                cookieStorage.addCookie(
+                    Url("https://account.live.com"),
+                    Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "account.live.com", path = "/", secure = true),
+                )
+
+                stageListener?.invoke("2b", "OTP Submit", true, "__Host-MSAAUTH received")
+                StageExecution.Success(Unit)
             }
-
-        if (msaAuthCookie == null) {
-            val msg = "Failed to establish authenticated session: __Host-MSAAUTH cookie not found"
-            stageListener?.invoke("2b", "OTP Submit", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_ESTABLISHMENT, msg))
         }
-
-        cookieStorage.addCookie(
-            Url("https://login.live.com"),
-            Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "login.live.com", path = "/", secure = true),
-        )
-        cookieStorage.addCookie(
-            Url("https://account.live.com"),
-            Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "account.live.com", path = "/", secure = true),
-        )
-
-        stageListener?.invoke("2b", "OTP Submit", true, "__Host-MSAAUTH received")
-        return StageExecution.Success(Unit)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        val msg = "Network timeout or Microsoft rate limit hit"
+        stageListener?.invoke("2b", "OTP Submit", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_ESTABLISHMENT, msg, cause = e))
     }
 
     private suspend fun executeStage3(
@@ -417,7 +437,7 @@ class RecoveryService(
         cookieStorage: CookiesStorage,
         uaid: String,
         stageListener: StageListener?,
-    ): StageExecution<Unit> {
+    ): StageExecution<Unit> = try {
         val loginCookies = cookieStorage.get(Url("https://login.live.com"))
         val currentUaid = loginCookies.firstOrNull { it.name == "uaid" }?.value ?: uaid
         val msaAuthValue = loginCookies.firstOrNull { it.name == "__Host-MSAAUTH" }?.value
@@ -426,118 +446,125 @@ class RecoveryService(
         if (msaAuthValue.isNullOrBlank()) {
             val msg = "Missing __Host-MSAAUTH cookie for session stabilization"
             stageListener?.invoke("3", "Session Polish", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
-        }
-
-        val cookieParts = mutableListOf("__Host-MSAAUTH=$msaAuthValue", "uaid=$currentUaid")
-        if (!amscValue.isNullOrBlank()) {
-            cookieParts.add("amsc=$amscValue")
-        }
-        val cleanCookieHeader = cookieParts.joinToString("; ")
-
-        val stabilizationUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$currentUaid&lc=1033&id=38936&mkt=en-US"
-
-        val isolatedClient = if (clientEngine != null) {
-            HttpClient(clientEngine) {
-                followRedirects = true
-                install(HttpRedirect) { checkHttpMethod = false }
-            }
+            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
         } else {
-            HttpClient(OkHttp.create()) {
-                followRedirects = true
-                install(HttpRedirect) { checkHttpMethod = false }
+            val cookieParts = mutableListOf("__Host-MSAAUTH=$msaAuthValue", "uaid=$currentUaid")
+            if (!amscValue.isNullOrBlank()) {
+                cookieParts.add("amsc=$amscValue")
             }
-        }
+            val cleanCookieHeader = cookieParts.joinToString("; ")
 
-        val polishResponse = isolatedClient.use {
-            it.get(stabilizationUrl) {
-                header(HttpHeaders.Cookie, cleanCookieHeader)
-                header(
-                    HttpHeaders.UserAgent,
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                )
-                header(
-                    HttpHeaders.Accept,
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                )
+            val stabilizationUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$currentUaid&lc=1033&id=38936&mkt=en-US"
+
+            val isolatedClient = if (clientEngine != null) {
+                HttpClient(clientEngine) {
+                    followRedirects = true
+                    install(HttpRedirect) { checkHttpMethod = false }
+                }
+            } else {
+                HttpClient(OkHttp.create()) {
+                    followRedirects = true
+                    install(HttpRedirect) { checkHttpMethod = false }
+                }
             }
-        }
 
-        val responseBodyString = polishResponse.bodyAsText()
-        val parsedDoc = Jsoup.parse(responseBodyString)
-        val htmlTitle = parsedDoc.title()
-        val hasPpft = responseBodyString.contains("name=\"PPFT\"")
-        val htmlSnippet = responseBodyString.take(500).replace("\r", "").replace("\n", " ")
+            val polishResponse = isolatedClient.use {
+                it.get(stabilizationUrl) {
+                    header(HttpHeaders.Cookie, cleanCookieHeader)
+                    header(
+                        HttpHeaders.UserAgent,
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    )
+                    header(
+                        HttpHeaders.Accept,
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    )
+                }
+            }
 
-        logger.info("=== STAGE 3 DEBUG ===")
-        logger.info("HTTP Status: {}", polishResponse.status)
-        logger.info("Location Header: {}", polishResponse.headers[HttpHeaders.Location] ?: "none")
-        logger.info("HTML Length: {}", responseBodyString.length)
-        logger.info("HTML Title: {}", htmlTitle)
-        if (hasPpft) {
-            logger.warn("CRITICAL: Response contains PPFT. Microsoft is asking to log in again.")
-        }
-        logger.info("HTML Snippet: {}", htmlSnippet)
+            val responseBodyString = polishResponse.bodyAsText()
+            val parsedDoc = Jsoup.parse(responseBodyString)
+            val htmlTitle = parsedDoc.title()
+            val hasPpft = responseBodyString.contains("name=\"PPFT\"")
+            val htmlSnippet = responseBodyString.take(500).replace("\r", "").replace("\n", " ")
 
-        val debugLogDetail = """
+            logger.info("=== STAGE 3 DEBUG ===")
+            logger.info("HTTP Status: {}", polishResponse.status)
+            logger.info("Location Header: {}", polishResponse.headers[HttpHeaders.Location] ?: "none")
+            logger.info("HTML Length: {}", responseBodyString.length)
+            logger.info("HTML Title: {}", htmlTitle)
+            if (hasPpft) {
+                logger.warn("CRITICAL: Response contains PPFT. Microsoft is asking to log in again.")
+            }
+            logger.info("HTML Snippet: {}", htmlSnippet)
+
+            val debugLogDetail = """
 Status: `${polishResponse.status}` | Title: `$htmlTitle` | Length: `${responseBodyString.length}`
 Location: `${polishResponse.headers[HttpHeaders.Location] ?: "none"}` | PPFT: `$hasPpft`
 ```html
 $htmlSnippet
 ```
 """.trimIndent()
-        stageListener?.invoke("3-debug", "Stage 3 Debug Dump", true, debugLogDetail)
+            stageListener?.invoke("3-debug", "Stage 3 Debug Dump", true, debugLogDetail)
 
-        val tokenT = parsedDoc.selectFirst("input[name=t]")?.attr("value")
+            val tokenT = parsedDoc.selectFirst("input[name=t]")?.attr("value")
 
-        if (tokenT.isNullOrBlank()) {
-            if (hasPpft) {
-                val msg = "Session expired or invalid, asked to login again."
-                stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
-            }
-            val msg = "Token t not found in HTML."
-            stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
-        }
-
-        val addProofResponse = client.submitForm(
-            url = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
-            formParameters = parameters { append("t", tokenT) },
-        )
-
-        val setCookieHeaders = addProofResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()
-        for (rawCookie in setCookieHeaders) {
-            if (rawCookie.contains("AMRPSSecAuth=")) {
-                val value = rawCookie.substringAfter("AMRPSSecAuth=").substringBefore(";")
-                cookieStorage.addCookie(
-                    Url("https://account.live.com"),
-                    Cookie(name = "AMRPSSecAuth", value = value, domain = "account.live.com", path = "/", secure = true),
+            if (tokenT.isNullOrBlank()) {
+                if (hasPpft) {
+                    val msg = "Session expired or invalid, asked to login again."
+                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
+                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                } else {
+                    val msg = "Token t not found in HTML."
+                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
+                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                }
+            } else {
+                val addProofResponse = client.submitForm(
+                    url = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
+                    formParameters = parameters { append("t", tokenT) },
                 )
-            }
-            if (rawCookie.contains("amsc=")) {
-                val value = rawCookie.substringAfter("amsc=").substringBefore(";")
-                cookieStorage.addCookie(
-                    Url("https://account.live.com"),
-                    Cookie(name = "amsc", value = value, domain = "account.live.com", path = "/", secure = true),
-                )
+
+                val setCookieHeaders = addProofResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()
+                for (rawCookie in setCookieHeaders) {
+                    if (rawCookie.contains("AMRPSSecAuth=")) {
+                        val value = rawCookie.substringAfter("AMRPSSecAuth=").substringBefore(";")
+                        cookieStorage.addCookie(
+                            Url("https://account.live.com"),
+                            Cookie(name = "AMRPSSecAuth", value = value, domain = "account.live.com", path = "/", secure = true),
+                        )
+                    }
+                    if (rawCookie.contains("amsc=")) {
+                        val value = rawCookie.substringAfter("amsc=").substringBefore(";")
+                        cookieStorage.addCookie(
+                            Url("https://account.live.com"),
+                            Cookie(name = "amsc", value = value, domain = "account.live.com", path = "/", secure = true),
+                        )
+                    }
+                }
+
+                val accountCookies = cookieStorage.get(Url("https://account.live.com"))
+                val hasAmrp = accountCookies.any { it.name == "AMRPSSecAuth" }
+                    || setCookieHeaders.any { it.contains("AMRPSSecAuth") }
+                val hasAmsc = accountCookies.any { it.name == "amsc" }
+                    || setCookieHeaders.any { it.contains("amsc") }
+
+                if (!hasAmrp || !hasAmsc) {
+                    val msg = "Missing AMRPSSecAuth or amsc cookies after session stabilization"
+                    stageListener?.invoke("3", "Session Polish", false, msg)
+                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                } else {
+                    stageListener?.invoke("3", "Session Polish", true, "AMRPSSecAuth received")
+                    StageExecution.Success(Unit)
+                }
             }
         }
-
-        val accountCookies = cookieStorage.get(Url("https://account.live.com"))
-        val hasAmrp = accountCookies.any { it.name == "AMRPSSecAuth" }
-            || setCookieHeaders.any { it.contains("AMRPSSecAuth") }
-        val hasAmsc = accountCookies.any { it.name == "amsc" }
-            || setCookieHeaders.any { it.contains("amsc") }
-
-        if (!hasAmrp || !hasAmsc) {
-            val msg = "Missing AMRPSSecAuth or amsc cookies after session stabilization"
-            stageListener?.invoke("3", "Session Polish", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
-        }
-
-        stageListener?.invoke("3", "Session Polish", true, "AMRPSSecAuth received")
-        return StageExecution.Success(Unit)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        val msg = "Network timeout or Microsoft rate limit hit"
+        stageListener?.invoke("3", "Session Polish", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg, cause = e))
     }
 
     private suspend fun executeStage4(
