@@ -475,10 +475,19 @@ class RecoveryService(
                         HttpHeaders.UserAgent,
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     )
+                    header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
                     header(
                         HttpHeaders.Accept,
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                     )
+                    header("Sec-Ch-Ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
+                    header("Sec-Ch-Ua-Mobile", "?0")
+                    header("Sec-Ch-Ua-Platform", "\"Windows\"")
+                    header("Sec-Fetch-Dest", "document")
+                    header("Sec-Fetch-Mode", "navigate")
+                    header("Sec-Fetch-Site", "same-site")
+                    header("Sec-Fetch-User", "?1")
+                    header("Upgrade-Insecure-Requests", "1")
                 }
             }
 
@@ -507,16 +516,29 @@ $htmlSnippet
 """.trimIndent()
             stageListener?.invoke("3-debug", "Stage 3 Debug Dump", true, debugLogDetail)
 
-            val tokenT = parsedDoc.selectFirst("input[name=t]")?.attr("value")
+            var tokenT = parsedDoc.selectFirst("input[name=t]")?.attr("value")
+            if (tokenT.isNullOrEmpty()) {
+                val match = Regex("""name=["']t["']\s+value=["']([^"']+)["']""").find(responseBodyString)
+                    ?: Regex("""value=["']([^"']+)["']\s+name=["']t["']""").find(responseBodyString)
+                    ?: Regex("""["']t["']\s*:\s*["']([^"']+)["']""").find(responseBodyString)
+                tokenT = match?.groupValues?.get(1)
+            }
 
             if (tokenT.isNullOrBlank()) {
-                if (hasPpft) {
+                val bodyText = parsedDoc.body().text()
+                logger.error("Stage 3 Failed. Microsoft Interstitial Text: {}", bodyText.take(500))
+
+                if (bodyText.contains("Protect", ignoreCase = true) || bodyText.contains("Verify", ignoreCase = true)) {
+                    val msg = "Microsoft requested additional identity verification (Captcha/2FA). Try again later or use a different IP."
+                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail\nText: ${bodyText.take(300)}")
+                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                } else if (hasPpft) {
                     val msg = "Session expired or invalid, asked to login again."
                     stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
                     StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
                 } else {
                     val msg = "Token t not found in HTML."
-                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
+                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail\nText: ${bodyText.take(300)}")
                     StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
                 }
             } else {

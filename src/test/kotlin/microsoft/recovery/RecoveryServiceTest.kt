@@ -563,4 +563,63 @@ class RecoveryServiceTest {
         assertEquals(RecoveryStage.CREDENTIAL_DISCOVERY, result.stage)
         assertEquals("Network timeout or Microsoft rate limit hit", result.message)
     }
+
+    @Test
+    fun testStage3InterstitialDetection(): Unit = runBlocking {
+        val engine = MockEngine { request ->
+            val path = request.url.encodedPath
+            when {
+                path == "/login.srf" && request.url.parameters.contains("wreply") -> {
+                    respond(
+                        content = "<html><head><title>Verify your identity</title></head><body><h1>Protect your account</h1><p>Please verify your identity.</p></body></html>",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+                path == "/login.srf" -> {
+                    respond(
+                        content = "<html><script>var ServerData = {\"sFTAg\":\"<input type=\\\"hidden\\\" name=\\\"PPFT\\\" id=\\\"i0327\\\" value=\\\"MOCK_PPFT_123\\\"/>\",\"canary\":\"\"};</script></html>",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+                path == "/GetCredentialType.srf" -> {
+                    respond(
+                        content = "{\"IfExistsResult\": 0, \"Credentials\": {\"HasPassword\": 1, \"OtcLoginEligibleProofs\": [{\"data\":\"proof_data_xyz\",\"display\":\"user@example.com\",\"type\":1}]}}",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                    )
+                }
+                path == "/GetOneTimeCode.srf" -> {
+                    respond(
+                        content = "{\"State\": 204, \"FlowToken\": \"MOCK_NEW_PPFT_456\"}",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                    )
+                }
+                path == "/ppsecure/post.srf" -> {
+                    respond(
+                        content = "<html>Redirecting...</html>",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(
+                            HttpHeaders.ContentType to listOf("text/html"),
+                            HttpHeaders.SetCookie to listOf("__Host-MSAAUTH=msa_session_cookie_token; Domain=login.live.com; Path=/; Secure"),
+                        ),
+                    )
+                }
+                else -> error("Unhandled request path: $path")
+            }
+        }
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newPassword = "Pass",
+            newEmail = "admin@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Failure>(result)
+        assertEquals(RecoveryStage.SESSION_POLISH, result.stage)
+        assertEquals("Microsoft requested additional identity verification (Captcha/2FA). Try again later or use a different IP.", result.message)
+    }
 }
