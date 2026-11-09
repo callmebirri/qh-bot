@@ -218,16 +218,22 @@ class RecoveryService(
 
         executeStage9(client, uaid, passKeyIds, activeCanary, stageListener)
 
-        if (accountRepository != null) {
-            accountRepository.saveAccount(
-                RecoveredAccount(
-                    originalEmail = email,
-                    currentPrimaryEmail = targetAliasEmail,
-                    password = newPassword,
-                    recoveryCode = finalRecoveryCode,
-                    ownsMinecraft = false,
-                ),
-            )
+        accountRepository?.let { repo ->
+            try {
+                repo.saveAccount(
+                    RecoveredAccount(
+                        originalEmail = email,
+                        currentPrimaryEmail = targetAliasEmail,
+                        password = newPassword,
+                        recoveryCode = finalRecoveryCode,
+                        ownsMinecraft = false,
+                        status = RecoveredAccount.STATUS_SUCCESS,
+                    ),
+                )
+            } catch (err: Exception) {
+                if (err is CancellationException) throw err
+                logger.error("Failed to save recovered account for {}: {}", email, err.message, err)
+            }
         }
 
         return RecoveryResult.Success(

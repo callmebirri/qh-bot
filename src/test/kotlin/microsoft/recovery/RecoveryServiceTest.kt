@@ -1,6 +1,7 @@
 package microsoft.recovery
 
 import database.DatabaseManager
+import database.model.RecoveredAccount
 import database.repository.SqliteAccountRepository
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
@@ -334,6 +335,58 @@ class RecoveryServiceTest {
         assertEquals(result.password, saved.password)
         assertEquals("FINAL-RECOV-44444-55555-66666", saved.recoveryCode)
         assertEquals("administrator2026@outlook.com", saved.currentPrimaryEmail)
+        assertEquals(RecoveredAccount.STATUS_SUCCESS, saved.status)
+
+        dbManager.close()
+        tempDb.delete()
+    }
+
+    @Test
+    fun testPendingStatusRemainsPendingOnFailureAndUpdatesOnRetry(): Unit = runBlocking {
+        val tempDb = File.createTempFile("test_idempotent_", ".db")
+        val dbManager = DatabaseManager(tempDb.absolutePath)
+        val repository = SqliteAccountRepository(dbManager)
+
+        repository.saveAccount(
+            RecoveredAccount(
+                originalEmail = "retryme@example.com",
+                status = RecoveredAccount.STATUS_PENDING,
+            ),
+        )
+
+        val failService = RecoveryService(
+            clientEngine = createMockEngine(failAtNotification = true),
+            stageDelayMs = 0L,
+            accountRepository = repository,
+        )
+        val failResult = failService.runLifecycle(
+            email = "retryme@example.com",
+            otpProvider = { "123456" },
+            newEmail = "alias_retry@outlook.com",
+        )
+        assertIs<RecoveryResult.Failure>(failResult)
+
+        val afterFailure = repository.getAccountByOriginalEmail("retryme@example.com")
+        assertNotNull(afterFailure)
+        assertEquals(RecoveredAccount.STATUS_PENDING, afterFailure.status)
+
+        val successService = RecoveryService(
+            clientEngine = createMockEngine(),
+            stageDelayMs = 0L,
+            accountRepository = repository,
+        )
+        val successResult = successService.runLifecycle(
+            email = "retryme@example.com",
+            otpProvider = { "123456" },
+            newEmail = "alias_retry@outlook.com",
+        )
+        assertIs<RecoveryResult.Success>(successResult)
+
+        val afterSuccess = repository.getAccountByOriginalEmail("retryme@example.com")
+        assertNotNull(afterSuccess)
+        assertEquals(RecoveredAccount.STATUS_SUCCESS, afterSuccess.status)
+        assertEquals("alias_retry@outlook.com", afterSuccess.currentPrimaryEmail)
+        assertEquals(1, repository.getAllAccounts().size)
 
         dbManager.close()
         tempDb.delete()

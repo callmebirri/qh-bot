@@ -41,6 +41,8 @@ class DatabaseManager(
                         password TEXT NOT NULL,
                         recovery_code TEXT,
                         owns_minecraft INTEGER DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'PENDING',
+                        fail_reason TEXT,
                         created_at INTEGER,
                         updated_at INTEGER
                     );
@@ -48,6 +50,22 @@ class DatabaseManager(
                     CREATE INDEX IF NOT EXISTS idx_recovered_accounts_primary ON recovered_accounts(current_primary_email);
                     """.trimIndent(),
                 )
+            }
+            ensureColumnExists(conn, "recovered_accounts", "status", "TEXT NOT NULL DEFAULT 'PENDING'")
+            ensureColumnExists(conn, "recovered_accounts", "fail_reason", "TEXT")
+        }
+    }
+
+    private fun ensureColumnExists(conn: Connection, tableName: String, columnName: String, columnDef: String) {
+        val existingColumns = mutableSetOf<String>()
+        conn.createStatement().use { stmt ->
+            stmt.executeQuery("PRAGMA table_info($tableName)").use { rs ->
+                while (rs.next()) {
+                    existingColumns.add(rs.getString("name").lowercase())
+                }
+            }
+            if (!existingColumns.contains(columnName.lowercase())) {
+                stmt.execute("ALTER TABLE $tableName ADD COLUMN $columnName $columnDef")
             }
         }
     }

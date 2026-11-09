@@ -40,7 +40,7 @@ fun kordModule(kord: Kord) = module {
     single { RecoveryService(accountRepository = get(), aliasClient = get()) }
     single { PingCommand() } bind CommandInterface::class
     single { CreateMessageEvent(get()) } bind EventInterface::class
-    single { RecoveryInteractionEvent(get(), get()) } bind EventInterface::class
+    single { RecoveryInteractionEvent(get(), get(), get()) } bind EventInterface::class
     single { CommandManager(get(), get(), getAll()) }
     single { EventManager(get(), get(), getAll()) }
 }
