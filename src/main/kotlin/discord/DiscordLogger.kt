@@ -28,7 +28,7 @@ class DiscordLogger(
     ) {
         if (logChannelId == 0L) return
         try {
-            val channel = MessageChannelBehavior(Snowflake(logChannelId), kord)
+            val channel = MessageChannelBehavior(Snowflake(logChannelId.toULong()), kord)
             val statusText = if (isSuccess) "Success" else "Failure"
             val embedColor = if (isSuccess) greenColor else redColor
 
@@ -54,7 +54,7 @@ class DiscordLogger(
     ) {
         if (notiChannelId == 0L) return
         try {
-            val channel = MessageChannelBehavior(Snowflake(notiChannelId), kord)
+            val channel = MessageChannelBehavior(Snowflake(notiChannelId.toULong()), kord)
 
             if (isSuccess) {
                 channel.createEmbed {
@@ -93,7 +93,7 @@ Recovery: ${recoveryCode ?: "N/A"}
     suspend fun sendInitialEmbed(notiChannelId: Long) {
         if (notiChannelId == 0L) return
         try {
-            val channel = MessageChannelBehavior(Snowflake(notiChannelId), kord)
+            val channel = MessageChannelBehavior(Snowflake(notiChannelId.toULong()), kord)
             channel.createMessage {
                 embed {
                     title = "Birrii Auto Secure - Microsoft Recovery"

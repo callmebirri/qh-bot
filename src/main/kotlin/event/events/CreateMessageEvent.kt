@@ -17,14 +17,14 @@ class CreateMessageEvent(
     override fun register(kord: Kord, properties: BotPropertiesManager) {
         kord.on<ReadyEvent> {
             try {
-                val channel = MessageChannelBehavior(Snowflake(properties.logChannelId), kord)
+                val channel = MessageChannelBehavior(Snowflake(properties.logChannelId.toULong()), kord)
                 channel.createEmbed {
                     title = "Birrii Auto Secure"
                     color = Color(255, 0, 255)
                     description = "Bot initialized successfully"
                 }
             } catch (e: Exception) {
-                val user = kord.getUser(Snowflake(properties.ownerId))?.getDmChannelOrNull()
+                val user = kord.getUser(Snowflake(properties.ownerId.toULong()))?.getDmChannelOrNull()
                 user?.createMessage("Notification/Log Channel ID is Invalid!")
             }
 

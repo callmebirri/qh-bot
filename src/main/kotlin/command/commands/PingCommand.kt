@@ -3,7 +3,6 @@ package command.commands
 import command.model.CommandInterface
 import config.BotPropertiesManager
 import dev.kord.core.Kord
-import dev.kord.core.behavior.interaction.respondPublic
 import dev.kord.core.behavior.interaction.response.respond
 import dev.kord.core.event.interaction.ChatInputCommandInteractionCreateEvent
 import kotlin.time.TimeSource
@@ -21,16 +20,14 @@ class PingCommand : CommandInterface {
         config: BotPropertiesManager
     ) {
         val interaction = event.interaction
-        interaction.respondPublic {
-            val start = TimeSource.Monotonic.markNow()
-            val response = interaction.deferEphemeralResponse()
-            val ltcy = start.elapsedNow()
-            val ping = event.kord.gateway.averagePing?.absoluteValue
-            response.respond {
-                content = "Pong!\n" +
-                        "API: ${ltcy.inWholeMilliseconds}ms\n" +
-                        "Gateway: ${ping ?: "null"}"
-            }
+        val response = interaction.deferPublicResponse()
+        val start = TimeSource.Monotonic.markNow()
+        val ltcy = start.elapsedNow()
+        val ping = event.kord.gateway.averagePing?.absoluteValue
+        response.respond {
+            content = "Pong!\n" +
+                    "API: ${ltcy.inWholeMilliseconds}ms\n" +
+                    "Gateway: ${ping ?: "null"}"
         }
     }
 }

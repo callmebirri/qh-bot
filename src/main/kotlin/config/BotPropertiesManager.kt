@@ -1,15 +1,15 @@
 package config
 
 import java.io.File
-import java.util.*
+import java.util.Properties
 
 @Suppress("UNUSED")
 class BotPropertiesManager {
     private var globalConfig: BotProperties = BotProperties(
-        ownerId = 1,
-        guildId = 2,
-        logChannelId = 3,
-        notiChannelId = 4,
+        ownerId = 1L,
+        guildId = 2L,
+        logChannelId = 3L,
+        notiChannelId = 4L,
     )
 
     init {
@@ -21,12 +21,20 @@ class BotPropertiesManager {
     }
 
     private fun loadConfig(path: String = "config.properties"): BotProperties {
-        val props = Properties().apply { File(path).inputStream().use { load(it) } }
+        val file = File(path)
+        if (!file.exists()) {
+            return globalConfig
+        }
+        val props = Properties().apply { file.inputStream().use { load(it) } }
+        fun parseId(key: String, default: Long = 0L): Long {
+            val raw = props.getProperty(key)?.trim()?.removeSurrounding("\"")?.removeSurrounding("'") ?: return default
+            return raw.toULongOrNull()?.toLong() ?: raw.toLongOrNull() ?: default
+        }
         return BotProperties(
-            ownerId = props.getProperty("owner.id").toLong(),
-            guildId = props.getProperty("guild.id").toLong(),
-            logChannelId = props.getProperty("log.channel.id").toLong(),
-            notiChannelId = props.getProperty("noti.channel.id")?.toLongOrNull() ?: 0L,
+            ownerId = parseId("owner.id", 1L),
+            guildId = parseId("guild.id", 2L),
+            logChannelId = parseId("log.channel.id", 3L),
+            notiChannelId = parseId("noti.channel.id", 0L),
         )
     }
 
