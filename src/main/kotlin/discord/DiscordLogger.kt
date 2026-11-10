@@ -7,8 +7,10 @@ import dev.kord.core.Kord
 import dev.kord.core.behavior.channel.MessageChannelBehavior
 import dev.kord.core.behavior.channel.createEmbed
 import dev.kord.core.behavior.channel.createMessage
+import dev.kord.core.entity.Message
 import dev.kord.rest.builder.message.actionRow
 import dev.kord.rest.builder.message.embed
+import kotlinx.coroutines.CancellationException
 import org.slf4j.LoggerFactory
 
 class DiscordLogger(
@@ -18,6 +20,7 @@ class DiscordLogger(
 
     private val greenColor = Color(87, 242, 135)
     private val redColor = Color(237, 66, 69)
+    private val yellowColor = Color(254, 231, 92)
 
     suspend fun logStage(
         logChannelId: Long,
@@ -87,6 +90,33 @@ Recovery: ${recoveryCode ?: "N/A"}
             }
         } catch (e: Exception) {
             logger.error("Failed to send final result embed to channel {}: {}", notiChannelId, e.message)
+        }
+    }
+
+    suspend fun sendAliasOtcPrompt(
+        channelId: Long,
+        alias: String,
+        sessionId: String,
+    ): Message? {
+        if (channelId == 0L) return null
+        return try {
+            val channel = MessageChannelBehavior(Snowflake(channelId.toULong()), kord)
+            channel.createMessage {
+                embed {
+                    title = "Stage 8: Nhập mã OTC Alias"
+                    description = "Đã gửi yêu cầu thêm alias `$alias`.\nVui lòng kiểm tra email nhận OTC cho alias này (hoặc dán link Verify) rồi nhấn nút bên dưới để nhập:"
+                    color = yellowColor
+                }
+                actionRow {
+                    interactionButton(ButtonStyle.Primary, "open_alias_otc_modal:$sessionId") {
+                        label = "Nhập OTC Alias"
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            logger.error("Failed to send alias OTC prompt embed to channel {}: {}", channelId, e.message)
+            null
         }
     }
 

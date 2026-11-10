@@ -776,7 +776,7 @@ class RecoveryServiceTest {
     }
 
     @Test
-    fun testStopsAtStage7ByDefaultAndMarksSuccess(): Unit = runBlocking {
+    fun testStopAfterStage7FlagSkipsStage8And9AndMarksSuccess(): Unit = runBlocking {
         val tempDb = File.createTempFile("test_stage7_stop_", ".db")
         val dbManager = DatabaseManager(tempDb.absolutePath)
         val repository = SqliteAccountRepository(dbManager)
@@ -804,6 +804,7 @@ class RecoveryServiceTest {
             clientEngine = spyEngine,
             stageDelayMs = 0L,
             accountRepository = repository,
+            stopAfterStage7 = true,
         )
 
         val result = service.runLifecycle(
@@ -910,13 +911,26 @@ class RecoveryServiceTest {
         val dbManager = DatabaseManager(tempDb.absolutePath)
         val repository = SqliteAccountRepository(dbManager)
 
+        var capturedVerifyJson: String? = null
+        var capturedVerifyCanary: String? = null
         var capturedRecoverJson: String? = null
+        var capturedRecoverCanary: String? = null
         var capturedAddAliasBody: String? = null
         val baseEngine = createMockEngine()
         val engine = MockEngine { request ->
             when (request.url.encodedPath) {
+                "/API/Recovery/VerifyRecoveryCode" -> {
+                    capturedVerifyJson = (request.body as? TextContent)?.text
+                    capturedVerifyCanary = request.headers["canary"]
+                    respond(
+                        content = """{"token":"verification_grant_token_123","apiCanary":"canary_token_after_verify"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                    )
+                }
                 "/API/Recovery/RecoverUser" -> {
                     capturedRecoverJson = (request.body as? TextContent)?.text
+                    capturedRecoverCanary = request.headers["canary"]
                     respond(
                         content = """{"recoveryCode":"FINAL-RECOV-99999-88888-77777","enableTfa":true,"apiCanary":"can_after_recover"}""",
                         status = HttpStatusCode.OK,
@@ -946,12 +960,25 @@ class RecoveryServiceTest {
         assertEquals("john.doe@qhuyy.tech", result.newPrimaryEmail)
         assertEquals("john.doe@qhuyy.tech", capturedAddAliasBody)
 
+        assertNotNull(capturedVerifyJson)
+        val verifyObj = MicrosoftHttpClientFactory.json.parseToJsonElement(capturedVerifyJson!!).jsonObject
+        assertEquals("2CBB3761027476727BDDBC9DE02870BE01ED793A", verifyObj["publicKey"]?.jsonPrimitive?.content)
+        assertEquals("INITIAL-RECOV-11111-22222-33333", verifyObj["recoveryCode"]?.jsonPrimitive?.content)
+        assertEquals("INITIAL-RECOV-11111-22222-33333", verifyObj["code"]?.jsonPrimitive?.content)
+        assertEquals("100103", verifyObj["scid"]?.jsonPrimitive?.content)
+        assertEquals("1001", verifyObj["uiflvr"]?.jsonPrimitive?.content)
+        assertEquals("s_recovery_token_+data_xyz", verifyObj["token"]?.jsonPrimitive?.content)
+        assertEquals("canary_token_reset_page", capturedVerifyCanary)
+
         assertNotNull(capturedRecoverJson)
         val recoverObj = MicrosoftHttpClientFactory.json.parseToJsonElement(capturedRecoverJson!!).jsonObject
         assertEquals("verification_grant_token_123", recoverObj["token"]?.jsonPrimitive?.content)
+        assertEquals("2CBB3761027476727BDDBC9DE02870BE01ED793A", recoverObj["publicKey"]?.jsonPrimitive?.content)
         assertEquals(result.password, recoverObj["password"]?.jsonPrimitive?.content)
-        assertEquals("john.doe@gmail.com", recoverObj["contactEmail"]?.jsonPrimitive?.content)
+        assertEquals("john.doe@qhuyy.tech", recoverObj["contactEmail"]?.jsonPrimitive?.content)
+        assertEquals("", recoverObj["contactEpid"]?.jsonPrimitive?.content)
         assertEquals("0", recoverObj["passwordExpiryEnabled"]?.jsonPrimitive?.content)
+        assertEquals("canary_token_after_verify", capturedRecoverCanary)
 
         val saved = repository.getAccountByOriginalEmail("john.doe@gmail.com")
         assertNotNull(saved)
@@ -960,5 +987,283 @@ class RecoveryServiceTest {
 
         dbManager.close()
         tempDb.delete()
+    }
+
+    @Test
+    fun testStage8UsesManualAliasOtcProviderWithoutCallingWorker(): Unit = runBlocking {
+        val tempDb = File.createTempFile("test_stage8_manual_otc_", ".db")
+        val dbManager = DatabaseManager(tempDb.absolutePath)
+        val repository = SqliteAccountRepository(dbManager)
+
+        var workerCalled = false
+        var verifiedOtc: String? = null
+        var promptedAlias: String? = null
+        val stagesLogged = mutableListOf<String>()
+
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/get-otc" -> {
+                    workerCalled = true
+                    error("Worker /get-otc should not be called when aliasOtcProvider is supplied")
+                }
+                "/Aliases/Verify" -> {
+                    verifiedOtc = request.url.parameters["otc"]
+                    respond("<html>Verified</html>", HttpStatusCode.OK)
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            accountRepository = repository,
+            aliasClient = AliasClient(sharedSecret = ""),
+        )
+
+        val result = service.runLifecycle(
+            email = "john.doe@gmail.com",
+            otpProvider = { "123456" },
+            stageListener = { stageKey, _, isSuccess, _ ->
+                stagesLogged.add("$stageKey:$isSuccess")
+            },
+            aliasOtcProvider = { alias ->
+                promptedAlias = alias
+                "https://account.live.com/Aliases/Verify?aliasname=john.doe%40qhuyy.tech&aliastype=Email&otc=MANUAL_OTC_777"
+            },
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertTrue(!workerCalled)
+        assertEquals("john.doe@qhuyy.tech", promptedAlias)
+        assertEquals("MANUAL_OTC_777", verifiedOtc)
+        assertEquals("john.doe@qhuyy.tech", result.newPrimaryEmail)
+        assertTrue(stagesLogged.contains("8:true"))
+        assertTrue(stagesLogged.contains("9:true"))
+
+        val saved = repository.getAccountByOriginalEmail("john.doe@gmail.com")
+        assertNotNull(saved)
+        assertEquals(RecoveredAccount.STATUS_SUCCESS, saved.status)
+        assertEquals("john.doe@qhuyy.tech", saved.currentPrimaryEmail)
+
+        dbManager.close()
+        tempDb.delete()
+    }
+
+    @Test
+    fun testRecoverUserError1247IncludesDiagnosticDetailsAndMarksFailed(): Unit = runBlocking {
+        val tempDb = File.createTempFile("test_recover_1247_", ".db")
+        val dbManager = DatabaseManager(tempDb.absolutePath)
+        val repository = SqliteAccountRepository(dbManager)
+        repository.saveAccount(RecoveredAccount(originalEmail = "victim@example.com", status = RecoveredAccount.STATUS_PENDING))
+        val stageDetails = mutableListOf<String>()
+
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            if (request.url.encodedPath == "/API/Recovery/RecoverUser") {
+                respond(
+                    content = """{"error":{"code":"1247","data":"token"}}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+            } else {
+                baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L, accountRepository = repository)
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newEmail = "recovered_alias@qhuyy.tech",
+            stageListener = { stageKey, _, _, detail ->
+                if (stageKey == "6") stageDetails.add(detail)
+            },
+        )
+
+        assertIs<RecoveryResult.Failure>(result)
+        assertEquals(RecoveryStage.PASSWORD_ROTATION, result.stage)
+        assertEquals("1247", result.errorCode)
+        assertTrue(result.message.contains("1247"))
+        assertTrue(result.message.contains("data=token"))
+        assertTrue(stageDetails.single().contains("tokenLen="))
+        assertTrue(stageDetails.single().contains("contactEmail=recovered_alias@qhuyy.tech"))
+
+        val saved = repository.getAccountByOriginalEmail("victim@example.com")
+        assertNotNull(saved)
+        assertEquals(RecoveredAccount.STATUS_FAILED, saved.status)
+
+        dbManager.close()
+        tempDb.delete()
+    }
+
+    @Test
+    fun testStage6ContactEmailFallsBackToEmptyWhenNewEmailMatchesOriginal(): Unit = runBlocking {
+        var capturedRecoverJson: String? = null
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            if (request.url.encodedPath == "/API/Recovery/RecoverUser") {
+                capturedRecoverJson = (request.body as? TextContent)?.text
+                respond(
+                    content = """{"recoveryCode":"FINAL-RECOV-12345-67890-ABCDE","enableTfa":true,"apiCanary":"can_after_recover"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+            } else {
+                baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L, stopAfterStage7 = true)
+        val result = service.runLifecycle(
+            email = "same@example.com",
+            otpProvider = { "123456" },
+            newEmail = "same@example.com",
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertNotNull(capturedRecoverJson)
+        val recoverObj = MicrosoftHttpClientFactory.json.parseToJsonElement(capturedRecoverJson!!).jsonObject
+        assertEquals("", recoverObj["contactEmail"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun testStage3DoSubmitDirectAddProofFormPostsAllHiddenFieldsToActionUrl(): Unit = runBlocking {
+        var addProofPostCount = 0
+        var postedUrl: String? = null
+        var postedT: String? = null
+        var postedPprid: String? = null
+        var postedAnon: String? = null
+
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            val path = request.url.encodedPath
+            when {
+                path == "/login.srf" && request.url.parameters.contains("wreply") -> {
+                    respond(
+                        content = """
+                            <html>
+                            <head><title>Continue</title><script>function DoSubmit(){document.fmHF.submit();}</script></head>
+                            <body onload="javascript:DoSubmit();">
+                            <form name="fmHF" id="fmHF" action="https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0&rpsnv=21" method="POST">
+                            <input type="hidden" name="t" value="DOSUBMIT_TOKEN_T"/>
+                            <input type="hidden" name="pprid" value="PPRID_XYZ"/>
+                            <input type="hidden" name="ANON" value="ANON_ABC"/>
+                            </form>
+                            </body>
+                            </html>
+                        """.trimIndent(),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+                path == "/proofs/Add" -> {
+                    addProofPostCount++
+                    postedUrl = request.url.toString()
+                    val form = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData
+                    postedT = form?.get("t")
+                    postedPprid = form?.get("pprid")
+                    postedAnon = form?.get("ANON")
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location to listOf("https://account.live.com/proofs/manage/additional"),
+                            HttpHeaders.SetCookie to listOf(
+                                "AMRPSSecAuth=amrp_dosubmit; path=/; domain=account.live.com",
+                                "amsc=amsc_dosubmit; path=/; domain=account.live.com",
+                            ),
+                        ),
+                    )
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L, stopAfterStage7 = true)
+        val result = service.runLifecycle(
+            email = "dosubmit@example.com",
+            otpProvider = { "123456" },
+            newEmail = "dosubmit@qhuyy.tech",
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertEquals(1, addProofPostCount)
+        assertTrue(postedUrl?.contains("rpsnv=21") == true)
+        assertEquals("DOSUBMIT_TOKEN_T", postedT)
+        assertEquals("PPRID_XYZ", postedPprid)
+        assertEquals("ANON_ABC", postedAnon)
+    }
+
+    @Test
+    fun testStage3DoSubmitIntermediateFormPostsFirstThenExtractsTokenT(): Unit = runBlocking {
+        var intermediatePostField: String? = null
+        var intermediateCookie: String? = null
+        var addProofToken: String? = null
+
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            val path = request.url.encodedPath
+            when {
+                path == "/login.srf" && request.url.parameters.contains("wreply") -> {
+                    respond(
+                        content = """
+                            <html>
+                            <head><title>Continue</title><script>function DoSubmit(){document.fmHF.submit();}</script></head>
+                            <body onload="javascript:DoSubmit();">
+                            <form name="fmHF" id="fmHF" action="https://login.live.com/intermediate.srf" method="POST">
+                            <input type="hidden" name="code" value="INTERMEDIATE_CODE_99"/>
+                            </form>
+                            </body>
+                            </html>
+                        """.trimIndent(),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+                path == "/intermediate.srf" -> {
+                    intermediateCookie = request.headers[HttpHeaders.Cookie]
+                    intermediatePostField = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData?.get("code")
+                    respond(
+                        content = """
+                            <html>
+                            <form>
+                            <input type="hidden" name="t" value="POST_INTERMEDIATE_TOKEN_T"/>
+                            </form>
+                            </html>
+                        """.trimIndent(),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+                path == "/proofs/Add" -> {
+                    addProofToken = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData?.get("t")
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.SetCookie to listOf(
+                                "AMRPSSecAuth=amrp_hop; path=/; domain=account.live.com",
+                                "amsc=amsc_hop; path=/; domain=account.live.com",
+                            ),
+                        ),
+                    )
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L, stopAfterStage7 = true)
+        val result = service.runLifecycle(
+            email = "hop@example.com",
+            otpProvider = { "123456" },
+            newEmail = "hop@qhuyy.tech",
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertEquals("INTERMEDIATE_CODE_99", intermediatePostField)
+        assertTrue(intermediateCookie?.contains("__Host-MSAAUTH=") == true)
+        assertEquals("POST_INTERMEDIATE_TOKEN_T", addProofToken)
     }
 }

@@ -13,6 +13,7 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.Url
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import io.ktor.http.parameters
@@ -23,6 +24,8 @@ import microsoft.recovery.model.GenericCanaryResponse
 import microsoft.recovery.model.MakePrimaryRequest
 import microsoft.recovery.util.MicrosoftHttpClientFactory
 import microsoft.recovery.util.RecoveryParsers
+import org.jsoup.Jsoup
+import org.slf4j.LoggerFactory
 import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -36,8 +39,20 @@ class AliasClient(
     private val timeProvider: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
 
+    private val logger = LoggerFactory.getLogger(AliasClient::class.java)
     private val secureRandom = SecureRandom()
     private val alphanumericChars = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+    fun extractOtcToken(rawInput: String): String {
+        val trimmed = rawInput.trim()
+        if (trimmed.contains("otc=", ignoreCase = true)) {
+            val parsed = runCatching { Url(trimmed).parameters["otc"] }.getOrNull()
+            if (!parsed.isNullOrBlank()) return parsed.trim()
+            val match = Regex("""[?&]otc=([^&\s]+)""", RegexOption.IGNORE_CASE).find(trimmed)
+            if (match != null) return match.groupValues[1].trim()
+        }
+        return trimmed
+    }
 
     fun generateRandomAlias(length: Int = 7): String {
         val prefix = (1..length).map { alphanumericChars[secureRandom.nextInt(alphanumericChars.length)] }.joinToString("")
@@ -66,13 +81,14 @@ class AliasClient(
         currentCanary: String,
         oldEmail: String,
         httpClient: HttpClient,
-    ): AliasRotationResult = rotateAlias(currentCanary, oldEmail, httpClient, null)
+    ): AliasRotationResult = rotateAlias(currentCanary, oldEmail, httpClient, null, null)
 
     suspend fun rotateAlias(
         currentCanary: String,
         oldEmail: String,
         httpClient: HttpClient,
         customAlias: String? = null,
+        aliasOtcProvider: (suspend (String) -> String)? = null,
     ): AliasRotationResult {
         var activeCanary = currentCanary
         val newAlias = customAlias ?: generateAliasFromEmail(oldEmail)
@@ -89,6 +105,20 @@ class AliasClient(
             },
         )
 
+        val addLocation = addAliasResponse.headers[HttpHeaders.Location]
+        val addFinalUrl = addAliasResponse.call.request.url.toString()
+        val addBody = runCatching { addAliasResponse.bodyAsText() }.getOrDefault("")
+        val addBodyText = Jsoup.parse(addBody).body().text().take(300)
+
+        logger.info(
+            "Stage 8 AddAssocId response: alias={}, status={}, finalUrl={}, location={}, bodyText={}",
+            newAlias,
+            addAliasResponse.status.value,
+            addFinalUrl,
+            addLocation ?: "none",
+            addBodyText,
+        )
+
         if (!addAliasResponse.status.isSuccess() &&
             addAliasResponse.status != HttpStatusCode.Found &&
             addAliasResponse.status != HttpStatusCode.SeeOther
@@ -96,7 +126,31 @@ class AliasClient(
             throw AliasVerificationFailedException("AddAssocId failed with status: ${addAliasResponse.status.value}")
         }
 
-        val otc = pollOtc(httpClient, newAlias)
+        if (addFinalUrl.contains("login.srf") ||
+            (addLocation != null && (addLocation.contains("login.srf") || addLocation.contains("login.live.com"))) ||
+            addBody.contains("Sign in to your account") ||
+            addBody.contains("name=\"PPFT\"")
+        ) {
+            throw AliasVerificationFailedException("AddAssocId redirected to login or unauthenticated session: $addFinalUrl")
+        }
+
+        if (addBody.contains("limit how frequently", ignoreCase = true) ||
+            addBody.contains("Error 1213", ignoreCase = true)
+        ) {
+            throw AliasVerificationFailedException("AddAssocId rate-limited by Microsoft: $addBodyText")
+        }
+
+        val rawOtc = if (aliasOtcProvider != null) {
+            logger.info("Stage 8 awaiting manual alias OTC input for {} (worker skipped)", newAlias)
+            aliasOtcProvider(newAlias)
+        } else {
+            pollOtc(httpClient, newAlias)
+        }
+        val otc = extractOtcToken(rawOtc)
+        if (otc.isBlank()) {
+            throw AliasVerificationFailedException("Provided alias OTC token is blank for $newAlias")
+        }
+
         verifyAlias(httpClient, newAlias, otc)
         activeCanary = makePrimary(httpClient, newAlias, activeCanary, uaid)
         removeOldAlias(httpClient, oldEmail, activeCanary)
@@ -174,11 +228,19 @@ class AliasClient(
         }
 
         val finalUrl = verifyResponse.call.request.url.toString()
+        val location = verifyResponse.headers[HttpHeaders.Location]
+        logger.info(
+            "Stage 8 Aliases/Verify response: alias={}, status={}, finalUrl={}, location={}",
+            alias,
+            verifyResponse.status.value,
+            finalUrl,
+            location ?: "none",
+        )
+
         if (finalUrl.contains("login.srf") || finalUrl.contains("login.live.com")) {
             throw AliasVerificationFailedException("Alias verification redirected to login page: $finalUrl")
         }
 
-        val location = verifyResponse.headers[HttpHeaders.Location]
         if (location != null && (location.contains("login.srf") || location.contains("login.live.com"))) {
             throw AliasVerificationFailedException("Alias verification redirected to login page: $location")
         }
@@ -210,6 +272,8 @@ class AliasClient(
                 )
             )
         }
+
+        logger.info("Stage 8 MakePrimary response: alias={}, status={}", alias, response.status.value)
 
         if (!response.status.isSuccess()) {
             throw AliasVerificationFailedException("MakePrimary failed with status: ${response.status.value}")
@@ -246,7 +310,9 @@ class AliasClient(
         }
 
         val html = response.bodyAsText()
-        if (!html.contains("Note_AssociatedIdRemoved") && !response.status.isSuccess()) {
+        val confirmed = html.contains("Note_AssociatedIdRemoved")
+        logger.info("Stage 8 RemoveAlias response: oldEmail={}, status={}, confirmed={}", oldEmail, response.status.value, confirmed)
+        if (!confirmed && !response.status.isSuccess()) {
             throw AliasVerificationFailedException("RemoveAlias response did not contain confirmation")
         }
     }

@@ -6,6 +6,7 @@ import database.repository.AccountRepository
 import dev.kord.common.entity.ButtonStyle
 import dev.kord.common.entity.TextInputStyle
 import dev.kord.core.Kord
+import dev.kord.core.behavior.edit
 import dev.kord.core.behavior.interaction.modal
 import dev.kord.core.behavior.interaction.respondEphemeral
 import dev.kord.core.behavior.interaction.response.edit
@@ -27,7 +28,9 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import microsoft.recovery.RecoveryService
+import microsoft.recovery.alias.OtcTimeoutException
 import microsoft.recovery.model.RecoveryResult
 import org.slf4j.LoggerFactory
 import java.util.UUID
@@ -43,6 +46,7 @@ class RecoveryInteractionEvent(
     private val logger = LoggerFactory.getLogger(RecoveryInteractionEvent::class.java)
     private val recoveryScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val pendingOtpSessions = ConcurrentHashMap<String, CompletableDeferred<String>>()
+    private val pendingAliasOtcSessions = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
     internal suspend fun prepareRecoveryAccount(email: String): Boolean = withContext(Dispatchers.IO) {
         if (email.isBlank()) return@withContext true
@@ -135,6 +139,40 @@ class RecoveryInteractionEvent(
                         logger.warn("Could not open recovery_step2_modal: {}", err.message)
                     }
                 }
+
+                componentId.startsWith("open_alias_otc_modal:") -> {
+                    val sessionId = componentId.substringAfter("open_alias_otc_modal:")
+                    if (!pendingAliasOtcSessions.containsKey(sessionId)) {
+                        runCatching {
+                            interaction.respondEphemeral {
+                                content = "Phiên nhập OTC alias này đã hết hạn hoặc đã được xử lý."
+                            }
+                        }.onFailure {
+                            if (it is CancellationException) {
+                                currentCoroutineContext().ensureActive()
+                            }
+                        }.onFailure { err ->
+                            logger.warn("Could not respond to expired alias OTC button: {}", err.message)
+                        }
+                    } else {
+                        runCatching {
+                            interaction.modal("Nhập mã OTC Alias", "recovery_alias_otc_modal:$sessionId") {
+                                actionRow {
+                                    textInput(TextInputStyle.Short, "alias_otc_input", "Mã OTC / Link Verify Alias") {
+                                        required = true
+                                        placeholder = "Nhập mã OTC hoặc dán link Verify..."
+                                    }
+                                }
+                            }
+                        }.onFailure {
+                            if (it is CancellationException) {
+                                currentCoroutineContext().ensureActive()
+                            }
+                        }.onFailure { err ->
+                            logger.warn("Could not open recovery_alias_otc_modal: {}", err.message)
+                        }
+                    }
+                }
             }
         }
 
@@ -203,6 +241,53 @@ class RecoveryInteractionEvent(
                                         isSuccess = isSuccess,
                                         detail = detail,
                                     )
+                                },
+                                aliasOtcProvider = { alias ->
+                                    val aliasSessionId = UUID.randomUUID().toString().take(8)
+                                    val aliasOtcDeferred = CompletableDeferred<String>()
+                                    pendingAliasOtcSessions[aliasSessionId] = aliasOtcDeferred
+                                    val promptChannelId = if (properties.logChannelId != 0L) {
+                                        properties.logChannelId
+                                    } else {
+                                        properties.notiChannelId
+                                    }
+                                    val promptMessage = discordLogger.sendAliasOtcPrompt(
+                                        channelId = promptChannelId,
+                                        alias = alias,
+                                        sessionId = aliasSessionId,
+                                    )
+                                    runCatching {
+                                        initialResponse?.edit {
+                                            content = "Stage 8: Nhấn nút bên dưới (hoặc trong kênh log) để nhập mã OTC cho alias `$alias`:"
+                                            actionRow {
+                                                interactionButton(ButtonStyle.Primary, "open_alias_otc_modal:$aliasSessionId") {
+                                                    label = "Nhập OTC Alias"
+                                                }
+                                            }
+                                        }
+                                    }.onFailure {
+                                        if (it is CancellationException) {
+                                            currentCoroutineContext().ensureActive()
+                                        }
+                                    }.onFailure { err ->
+                                        logger.warn("Could not update ephemeral message with alias OTC button: {}", err.message)
+                                    }
+                                    try {
+                                        withTimeoutOrNull(300_000L.milliseconds) {
+                                            aliasOtcDeferred.await()
+                                        } ?: throw OtcTimeoutException("Hết thời gian chờ nhập mã OTC cho alias $alias (5 phút)")
+                                    } finally {
+                                        pendingAliasOtcSessions.remove(aliasSessionId)
+                                        runCatching {
+                                            promptMessage?.edit {
+                                                components = mutableListOf()
+                                            }
+                                        }.onFailure {
+                                            if (it is CancellationException) {
+                                                currentCoroutineContext().ensureActive()
+                                            }
+                                        }
+                                    }
                                 },
                             )
 
@@ -295,6 +380,25 @@ class RecoveryInteractionEvent(
                     }
 
                     pendingOtpSessions[sessionId]?.complete(otp)
+                }
+
+                modalId.startsWith("recovery_alias_otc_modal:") -> {
+                    val sessionId = modalId.substringAfter("recovery_alias_otc_modal:")
+                    val rawAliasOtc = interaction.textInputs["alias_otc_input"]?.value?.trim().orEmpty()
+
+                    runCatching {
+                        interaction.respondEphemeral {
+                            content = "Đã nhận mã OTC alias. Đang tiếp tục Stage 8..."
+                        }
+                    }.onFailure {
+                        if (it is CancellationException) {
+                            currentCoroutineContext().ensureActive()
+                        }
+                    }.onFailure { err ->
+                        logger.warn("Could not respond to alias OTC modal interaction: {}", err.message)
+                    }
+
+                    pendingAliasOtcSessions[sessionId]?.complete(rawAliasOtc)
                 }
             }
         }

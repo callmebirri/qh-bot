@@ -16,6 +16,7 @@ import java.security.SecureRandom
 object RecoveryParsers {
     private val secureRandom = SecureRandom()
     private val unicodeRegex = Regex("""\\u([0-9a-fA-F]{4})""")
+    private val hexEscapeRegex = Regex("""\\x([0-9a-fA-F]{2})""")
     private val ppftRegex = Regex("""name=\\?"PPFT\\?"[^>]*value=\\?"([^"\\]+)""")
     private val fallbackPpftRegex = Regex("""name="PPFT"[^>]*value="([^"]+)"""")
     private val tokenTRegex = Regex("""<input[^>]+name="t"[^>]+value="([^"]*)"""")
@@ -63,6 +64,10 @@ object RecoveryParsers {
     }
 
     fun unescapeUnicode(input: String): String = unicodeRegex.replace(input) { matchResult ->
+        matchResult.groupValues[1].toInt(16).toChar().toString()
+    }
+
+    private fun unescapeHex(input: String): String = hexEscapeRegex.replace(input) { matchResult ->
         matchResult.groupValues[1].toInt(16).toChar().toString()
     }
 
@@ -119,7 +124,7 @@ object RecoveryParsers {
 
     private fun decodeRegexToken(raw: String, json: Json): String {
         val jsonDecoded = runCatching { json.decodeFromString<String>("\"$raw\"") }
-            .getOrElse { raw.replace("\\/", "/") }
+            .getOrElse { unescapeHex(raw.replace("\\/", "/")) }
         return unescapeUnicode(jsonDecoded)
     }
 

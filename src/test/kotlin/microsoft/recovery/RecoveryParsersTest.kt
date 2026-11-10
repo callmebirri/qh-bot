@@ -143,6 +143,22 @@ class RecoveryParsersTest {
     }
 
     @Test
+    fun testExtractResetPasswordDataDecodesHexAndUnicodeFallbacks() {
+        val html = """
+            <html>
+            <script>
+            var ServerData = { badJs: foo(), "sRecoveryToken": "tok\x2bpart\u002f1\x3d", "apiCanary": "can\x2b2\u003d" };
+            </script>
+            </html>
+        """.trimIndent()
+
+        val data = RecoveryParsers.extractResetPasswordData(html, MicrosoftHttpClientFactory.json)
+        assertNotNull(data)
+        assertEquals("tok+part/1=", data.sRecoveryToken)
+        assertEquals("can+2=", data.apiCanary)
+    }
+
+    @Test
     fun testExtractManageProofsDataFlexibleFormatsAndServerDataFallback() {
         val html = """
             <html>
