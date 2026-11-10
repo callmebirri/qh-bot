@@ -5,15 +5,43 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      run_bot:
+        description: 'Run the bot after building'
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Check if bot should run
+        id: check_run
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run=${{ inputs.run_bot }}" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch -> should_run=${{ inputs.run_bot }}"
+            exit 0
+          fi
+
+          SUBJECT="$(git log -1 --pretty=%s)"
+          TRIMMED_SUBJECT="${SUBJECT%"${SUBJECT##*[![:space:]]}"}"
+          FULL_MSG="$(git log -1 --pretty=%B)"
+          TRIMMED_FULL="${FULL_MSG%"${FULL_MSG##*[![:space:]]}"}"
+
+          if [[ "$TRIMMED_SUBJECT" == *"[run]" ]] || [[ "$TRIMMED_FULL" == *"[run]" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Commit ends with [run] -> build and run bot."
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Commit does not end with [run] -> build only."
+          fi
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -31,29 +59,31 @@ jobs:
         run: ./gradlew shadowJar --no-daemon
 
       - name: Prepare runtime directory
+        if: steps.check_run.outputs.should_run == 'true'
         run: |
           cp config.properties build/libs/
           mkdir -p build/libs/logs build/libs/data
 
-      - name: Run Bot with 10-minute timeout
+      - name: Run Bot with 5-minute timeout
+        if: steps.check_run.outputs.should_run == 'true'
         env:
           DBT: ${{ secrets.DBT }}
           SHARED_SECRET: ${{ secrets.SHARED_SECRET }}
         run: |
           cd build/libs
-          echo "Starting bot with 10-minute timeout..."
-          
+          echo "Starting bot with 5-minute timeout..."
+
           set +e
-          timeout -s TERM -k 15s 10m java -jar qh-bot-1.0-SNAPSHOT.jar
+          timeout -s TERM -k 15s 5m java -jar qh-bot-1.0-SNAPSHOT.jar
           EXIT_CODE=$?
           set -e
 
           echo "Process exited with code: $EXIT_CODE"
 
-          # Exit code 124 means timeout terminated the command normally after 10 minutes
+          # Exit code 124 means timeout terminated the command normally after 5 minutes
           # Exit code 143 (128 + 15) means SIGTERM was handled on termination
           if [ "$EXIT_CODE" -eq 124 ] || [ "$EXIT_CODE" -eq 143 ] || [ "$EXIT_CODE" -eq 0 ]; then
-            echo "Bot run completed successfully (terminated after 10 minutes or completed cleanly)."
+            echo "Bot run completed successfully (terminated after 5 minutes or completed cleanly)."
             exit 0
           else
             echo "Bot failed unexpectedly with exit code $EXIT_CODE"
