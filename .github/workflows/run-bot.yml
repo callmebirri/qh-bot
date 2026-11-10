@@ -35,12 +35,12 @@ jobs:
           FULL_MSG="$(git log -1 --pretty=%B)"
           TRIMMED_FULL="${FULL_MSG%"${FULL_MSG##*[![:space:]]}"}"
 
-          if [[ "$TRIMMED_SUBJECT" == *"[run]" ]] || [[ "$TRIMMED_FULL" == *"[run]" ]]; then
+          if [[ "$TRIMMED_SUBJECT" == *"[run]" ]] || [[ "$TRIMMED_FULL" == *"[run]" ]] || [[ "$TRIMMED_SUBJECT" == *"[bot]" ]] || [[ "$TRIMMED_FULL" == *"[bot]" ]]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "Commit ends with [run] -> build and run bot."
+            echo "Commit ends with [run] or [bot] -> build and run bot."
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "Commit does not end with [run] -> build only."
+            echo "Commit does not end with [run] or [bot] -> build only."
           fi
 
       - name: Set up JDK 21

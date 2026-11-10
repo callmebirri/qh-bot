@@ -2,6 +2,9 @@ package microsoft.recovery.alias
 
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.cookies.AcceptAllCookiesStorage
+import io.ktor.client.plugins.cookies.CookiesStorage
 import io.ktor.client.plugins.cookies.cookies
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.get
@@ -9,14 +12,17 @@ import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.Cookie
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.Url
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import io.ktor.http.parameters
+import io.ktor.http.parseServerSetCookieHeader
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -81,7 +87,7 @@ class AliasClient(
         currentCanary: String,
         oldEmail: String,
         httpClient: HttpClient,
-    ): AliasRotationResult = rotateAlias(currentCanary, oldEmail, httpClient, null, null)
+    ): AliasRotationResult = rotateAlias(currentCanary, oldEmail, httpClient, null, null, null, null, null)
 
     suspend fun rotateAlias(
         currentCanary: String,
@@ -89,22 +95,113 @@ class AliasClient(
         httpClient: HttpClient,
         customAlias: String? = null,
         aliasOtcProvider: (suspend (String) -> String)? = null,
+        cookieStorage: CookiesStorage? = null,
+        sessionUaid: String? = null,
+        debugListener: (suspend (String) -> Unit)? = null,
     ): AliasRotationResult {
-        var activeCanary = currentCanary
-        val newAlias = customAlias ?: generateAliasFromEmail(oldEmail)
-        val uaid = RecoveryParsers.generateUaid()
+        val candidateAlias = customAlias?.trim()?.takeIf { it.isNotEmpty() } ?: generateAliasFromEmail(oldEmail)
+        val newAlias = if (candidateAlias.contains("@")) candidateAlias else "$candidateAlias@$domain"
+        val aliasPrefix = newAlias.substringBefore("@")
+        val aliasDomain = newAlias.substringAfter("@")
+        val targetStorage = cookieStorage ?: AcceptAllCookiesStorage()
+        val cookieUaid = extractLoginUaidCookie(httpClient, targetStorage)
+        val makePrimaryUaid = cookieUaid
+            ?: sessionUaid?.trim()?.takeIf { it.isNotEmpty() }
+            ?: RecoveryParsers.generateUaid()
 
-        val addAliasResponse = httpClient.submitForm(
-            url = "https://account.live.com/AddAssocId",
-            formParameters = parameters {
-                append("canary", activeCanary)
-                append("PostOption", "NONE")
-                append("SingleDomain", "")
-                append("AddAssocIdOptions", "LIVE")
-                append("AssociatedIdLive", newAlias)
-            },
-        )
+        val noRedirectClient = HttpClient(httpClient.engine) {
+            followRedirects = false
+            install(HttpTimeout) {
+                requestTimeoutMillis = 30000
+                connectTimeoutMillis = 15000
+                socketTimeoutMillis = 30000
+            }
+        }
 
+        val (freshApiCanary, addAliasResponse) = noRedirectClient.use { stageClient ->
+            val (refreshCookieHeader, _) = buildStage8CookieHeader(httpClient, targetStorage, "GET /proofs/manage/additional")
+            val refreshedCanary = fetchFreshApiCanary(stageClient, currentCanary, refreshCookieHeader, targetStorage)
+
+            val refreshedCookieUaid = extractLoginUaidCookie(httpClient, targetStorage) ?: cookieUaid
+            val (addCookieHeader, maskedCookieDetail) = buildStage8CookieHeader(httpClient, targetStorage, "POST /AddAssocId")
+            val formPairs = buildList {
+                add("canary" to refreshedCanary)
+                add("PostOption" to "NONE")
+                add("SingleDomain" to aliasDomain)
+                add("UpSell" to "")
+                add("AddAssocIdOptions" to "LIVE")
+                add("AssociatedIdLive" to aliasPrefix)
+                if (refreshedCookieUaid != null) {
+                    add("uaid" to refreshedCookieUaid)
+                }
+            }
+
+            val maskedHeaders = buildString {
+                appendLine("canary=${maskValue(refreshedCanary)}")
+                appendLine("Referer=https://account.live.com/proofs/manage/additional")
+                appendLine("Origin=https://account.live.com")
+                appendLine("User-Agent=${MicrosoftHttpClientFactory.DEFAULT_USER_AGENT}")
+                appendLine("Accept-Language=en-US,en;q=0.9")
+                appendLine("Accept=text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                append("Cookie=$maskedCookieDetail")
+            }
+
+            val maskedParams = buildString {
+                append(
+                    formPairs.joinToString("\n") { (k, v) ->
+                        val display = if (k == "canary") maskValue(v) else if (v.isEmpty()) "(empty)" else v
+                        "$k=$display"
+                    }
+                )
+                if (refreshedCookieUaid == null) {
+                    append("\nuaid=(omitted - no uaid cookie under login.live.com)")
+                }
+            }
+
+            val debugSummary = buildString {
+                appendLine("**Headers:**")
+                appendLine("```text")
+                appendLine(maskedHeaders)
+                appendLine("```")
+                appendLine("**Form Parameters:**")
+                appendLine("```text")
+                appendLine(maskedParams)
+                append("```")
+            }
+
+            logger.info(
+                "Stage 8 POST /AddAssocId debug:\nHeaders:\n{}\nForm:\n{}",
+                maskedHeaders,
+                maskedParams,
+            )
+            debugListener?.invoke(debugSummary)
+
+            val postResponse = stageClient.submitForm(
+                url = "https://account.live.com/AddAssocId",
+                formParameters = parameters {
+                    for ((key, value) in formPairs) {
+                        append(key, value)
+                    }
+                },
+            ) {
+                header("canary", refreshedCanary)
+                header("Referer", "https://account.live.com/proofs/manage/additional")
+                header("Origin", "https://account.live.com")
+                header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+                header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+                header(
+                    HttpHeaders.Accept,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                if (addCookieHeader.isNotBlank()) {
+                    header(HttpHeaders.Cookie, addCookieHeader)
+                }
+            }
+            persistAccountSetCookies(postResponse, targetStorage)
+            refreshedCanary to postResponse
+        }
+
+        var activeCanary = freshApiCanary
         val addLocation = addAliasResponse.headers[HttpHeaders.Location]
         val addFinalUrl = addAliasResponse.call.request.url.toString()
         val addBody = runCatching { addAliasResponse.bodyAsText() }.getOrDefault("")
@@ -119,19 +216,49 @@ class AliasClient(
             addBodyText,
         )
 
+        if ((addAliasResponse.status == HttpStatusCode.Found ||
+                addAliasResponse.status == HttpStatusCode.SeeOther ||
+                addAliasResponse.status == HttpStatusCode.TemporaryRedirect) &&
+            addLocation != null &&
+            addLocation.contains("login.microsoftonline.com", ignoreCase = true)
+        ) {
+            logger.error(
+                "Stage 8 AddAssocId {} redirect Location before SessionExpiredException: {}",
+                addAliasResponse.status.value,
+                addLocation,
+            )
+            throw SessionExpiredException(
+                "Session expired during Alias Rotation. Cannot add alias.",
+                redirectLocation = addLocation,
+            )
+        }
+
+        if (addFinalUrl.contains("login.microsoftonline.com", ignoreCase = true) ||
+            addFinalUrl.contains("login.srf", ignoreCase = true) ||
+            (addLocation != null &&
+                (addLocation.contains("login.srf", ignoreCase = true) ||
+                    addLocation.contains("login.live.com", ignoreCase = true) ||
+                    addLocation.contains("login.microsoftonline.com", ignoreCase = true))) ||
+            addBody.contains("Sign in to your account") ||
+            addBody.contains("name=\"PPFT\"")
+        ) {
+            logger.error(
+                "Stage 8 AddAssocId unauthenticated response before SessionExpiredException: status={}, finalUrl={}, location={}",
+                addAliasResponse.status.value,
+                addFinalUrl,
+                addLocation ?: "none",
+            )
+            throw SessionExpiredException(
+                "Session expired during Alias Rotation. Cannot add alias.",
+                redirectLocation = addLocation ?: addFinalUrl,
+            )
+        }
+
         if (!addAliasResponse.status.isSuccess() &&
             addAliasResponse.status != HttpStatusCode.Found &&
             addAliasResponse.status != HttpStatusCode.SeeOther
         ) {
             throw AliasVerificationFailedException("AddAssocId failed with status: ${addAliasResponse.status.value}")
-        }
-
-        if (addFinalUrl.contains("login.srf") ||
-            (addLocation != null && (addLocation.contains("login.srf") || addLocation.contains("login.live.com"))) ||
-            addBody.contains("Sign in to your account") ||
-            addBody.contains("name=\"PPFT\"")
-        ) {
-            throw AliasVerificationFailedException("AddAssocId redirected to login or unauthenticated session: $addFinalUrl")
         }
 
         if (addBody.contains("limit how frequently", ignoreCase = true) ||
@@ -151,8 +278,8 @@ class AliasClient(
             throw AliasVerificationFailedException("Provided alias OTC token is blank for $newAlias")
         }
 
-        verifyAlias(httpClient, newAlias, otc)
-        activeCanary = makePrimary(httpClient, newAlias, activeCanary, uaid)
+        verifyAlias(httpClient, newAlias, otc, targetStorage)
+        activeCanary = makePrimary(httpClient, newAlias, activeCanary, makePrimaryUaid)
         removeOldAlias(httpClient, oldEmail, activeCanary)
 
         return AliasRotationResult(
@@ -160,6 +287,166 @@ class AliasClient(
             newEmail = newAlias,
             updatedCanary = activeCanary,
         )
+    }
+
+    private suspend fun extractLoginUaidCookie(
+        httpClient: HttpClient,
+        storage: CookiesStorage,
+    ): String? {
+        val fromStorage = storage.get(Url("https://login.live.com"))
+            .firstOrNull { it.name == "uaid" }
+            ?.value
+            ?.takeIf { it.isNotBlank() }
+        if (fromStorage != null) return fromStorage
+
+        return runCatching {
+            httpClient.cookies("https://login.live.com")
+                .firstOrNull { it.name == "uaid" }
+                ?.value
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    private fun maskValue(value: String): String {
+        if (value.isEmpty()) return "(empty)"
+        if (value.length <= 8) return "*** (len=${value.length})"
+        return "${value.take(4)}...${value.takeLast(4)} (len=${value.length})"
+    }
+
+    private suspend fun buildStage8CookieHeader(
+        httpClient: HttpClient,
+        storage: CookiesStorage,
+        operationName: String,
+    ): Pair<String, String> {
+        val storageLoginCookies = storage.get(Url("https://login.live.com"))
+        val storageAccountCookies = storage.get(Url("https://account.live.com"))
+        val clientLoginCookies = runCatching { httpClient.cookies("https://login.live.com") }.getOrNull().orEmpty()
+        val clientAccountCookies = runCatching { httpClient.cookies("https://account.live.com") }.getOrNull().orEmpty()
+
+        val merged = linkedMapOf<String, Cookie>()
+        for (cookie in storageLoginCookies + clientLoginCookies) {
+            merged[cookie.name] = cookie
+        }
+        for (cookie in storageAccountCookies + clientAccountCookies) {
+            merged[cookie.name] = cookie
+        }
+
+        val requiredNames = listOf("__Host-MSAAUTH", "AMRPSSecAuth", "amsc")
+        val isolated = requiredNames.mapNotNull { name ->
+            merged[name]?.takeIf { it.value.isNotBlank() }?.let { name to it.value }
+        }
+        val missing = requiredNames.filter { name -> isolated.none { it.first == name } }
+
+        val maskedCookieSummary = if (isolated.isEmpty()) {
+            "(none; missing=${missing.joinToString(",")})"
+        } else {
+            val attached = isolated.joinToString("; ") { (name, value) -> "$name=${maskValue(value)}" }
+            if (missing.isEmpty()) attached else "$attached | missing=${missing.joinToString(",")}"
+        }
+
+        if (missing.isNotEmpty()) {
+            logger.warn(
+                "Stage 8 cookie isolation for {}: missing={}, attached={}, allStorageCookieNames={}",
+                operationName,
+                missing.joinToString(","),
+                isolated.joinToString(",") { it.first },
+                merged.keys.joinToString(","),
+            )
+        } else {
+            logger.info(
+                "Stage 8 cookie isolation for {}: attached=ALL_3 ({}), allStorageCookieNames={}",
+                operationName,
+                maskedCookieSummary,
+                merged.keys.joinToString(","),
+            )
+        }
+
+        val rawCookieHeader = isolated.joinToString("; ") { (name, value) -> "$name=$value" }
+        return rawCookieHeader to maskedCookieSummary
+    }
+
+    private suspend fun persistAccountSetCookies(
+        response: HttpResponse,
+        storage: CookiesStorage,
+    ) {
+        val accountUrl = Url("https://account.live.com")
+        for (rawHeader in response.headers.getAll(HttpHeaders.SetCookie).orEmpty()) {
+            val parsed = runCatching { parseServerSetCookieHeader(rawHeader) }.getOrNull()
+            if (parsed != null && parsed.name.isNotBlank()) {
+                storage.addCookie(
+                    accountUrl,
+                    parsed.copy(
+                        domain = parsed.domain ?: "account.live.com",
+                        path = parsed.path ?: "/",
+                    ),
+                )
+            }
+        }
+    }
+
+    private suspend fun fetchFreshApiCanary(
+        client: HttpClient,
+        fallbackCanary: String,
+        cookieHeader: String,
+        storage: CookiesStorage,
+    ): String {
+        val manageResponse = client.get("https://account.live.com/proofs/manage/additional") {
+            header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+            header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+            header(
+                HttpHeaders.Accept,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            if (cookieHeader.isNotBlank()) {
+                header(HttpHeaders.Cookie, cookieHeader)
+            }
+        }
+        persistAccountSetCookies(manageResponse, storage)
+
+        val location = manageResponse.headers[HttpHeaders.Location]
+        val finalUrl = manageResponse.call.request.url.toString()
+        if ((manageResponse.status == HttpStatusCode.Found ||
+                manageResponse.status == HttpStatusCode.SeeOther ||
+                manageResponse.status == HttpStatusCode.TemporaryRedirect) &&
+            location != null &&
+            (location.contains("login.microsoftonline.com", ignoreCase = true) ||
+                location.contains("login.live.com", ignoreCase = true) ||
+                location.contains("login.srf", ignoreCase = true))
+        ) {
+            logger.error(
+                "Stage 8 GET /proofs/manage/additional {} redirect Location before SessionExpiredException: {}",
+                manageResponse.status.value,
+                location,
+            )
+            throw SessionExpiredException(
+                "Session expired during Alias Rotation. Cannot add alias.",
+                redirectLocation = location,
+            )
+        }
+        if (finalUrl.contains("login.microsoftonline.com", ignoreCase = true) ||
+            finalUrl.contains("login.srf", ignoreCase = true)
+        ) {
+            logger.error(
+                "Stage 8 GET /proofs/manage/additional unauthenticated URL before SessionExpiredException: status={}, finalUrl={}, location={}",
+                manageResponse.status.value,
+                finalUrl,
+                location ?: "none",
+            )
+            throw SessionExpiredException(
+                "Session expired during Alias Rotation. Cannot add alias.",
+                redirectLocation = location ?: finalUrl,
+            )
+        }
+
+        val html = runCatching { manageResponse.bodyAsText() }.getOrDefault("")
+        val extracted = RecoveryParsers.extractApiCanary(html, MicrosoftHttpClientFactory.json)
+        if (!extracted.isNullOrBlank()) {
+            logger.info("Stage 8 refreshed apiCanary from /proofs/manage/additional (length={})", extracted.length)
+            return extracted
+        }
+
+        logger.warn("Stage 8 could not extract fresh apiCanary from /proofs/manage/additional (status={}); using existing canary (length={})", manageResponse.status.value, fallbackCanary.length)
+        return fallbackCanary
     }
 
     private suspend fun pollOtc(
@@ -198,9 +485,12 @@ class AliasClient(
         httpClient: HttpClient,
         alias: String,
         otc: String,
+        storage: CookiesStorage,
     ) {
-        val loginCookies = runCatching { httpClient.cookies("https://login.live.com") }.getOrNull().orEmpty()
-        val accountCookies = runCatching { httpClient.cookies("https://account.live.com") }.getOrNull().orEmpty()
+        val loginCookies = storage.get(Url("https://login.live.com")) +
+            runCatching { httpClient.cookies("https://login.live.com") }.getOrNull().orEmpty()
+        val accountCookies = storage.get(Url("https://account.live.com")) +
+            runCatching { httpClient.cookies("https://account.live.com") }.getOrNull().orEmpty()
         val allCookies = (loginCookies + accountCookies).associateBy { it.name }
 
         val cookieValues = listOfNotNull(
@@ -213,7 +503,8 @@ class AliasClient(
             parameter("aliasname", alias)
             parameter("aliastype", "Email")
             parameter("otc", otc)
-            header(HttpHeaders.UserAgent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
+            header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+            header("Referer", "https://account.live.com/proofs/manage/additional")
             if (cookieValues.isNotEmpty()) {
                 header(HttpHeaders.Cookie, cookieValues.joinToString("; "))
             }

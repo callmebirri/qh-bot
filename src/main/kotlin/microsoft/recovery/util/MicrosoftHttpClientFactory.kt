@@ -18,6 +18,9 @@ import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.json.Json
 
 object MicrosoftHttpClientFactory {
+    const val DEFAULT_USER_AGENT: String =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
     val json: Json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -50,10 +53,7 @@ object MicrosoftHttpClientFactory {
             maxSendCount = 1000
         }
         defaultRequest {
-            header(
-                HttpHeaders.UserAgent,
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
+            header(HttpHeaders.UserAgent, DEFAULT_USER_AGENT)
             header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
             header(
                 HttpHeaders.Accept,

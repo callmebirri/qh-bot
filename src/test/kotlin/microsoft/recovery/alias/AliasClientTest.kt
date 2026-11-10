@@ -6,6 +6,7 @@ import io.ktor.client.engine.mock.respond
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.cookies.AcceptAllCookiesStorage
 import io.ktor.client.plugins.cookies.HttpCookies
+import io.ktor.client.request.forms.FormDataContent
 import io.ktor.http.Cookie
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -47,13 +48,50 @@ class AliasClientTest {
     @Test
     fun testRotateAliasSuccess(): Unit = runBlocking {
         var verifyCookiesHeader: String? = null
+        var verifyUserAgent: String? = null
+        var addAssocCookieHeader: String? = null
+        var addAssocReferer: String? = null
+        var addAssocUserAgent: String? = null
+        var refreshUserAgent: String? = null
+        var addAssocHeaderCanary: String? = null
+        var addAssocFormCanary: String? = null
+        var addAssocPostOption: String? = null
+        var addAssocSingleDomain: String? = null
+        var addAssocUpSell: String? = null
+        var addAssocOptions: String? = null
+        var addAssocLive: String? = null
+        var addAssocUaid: String? = null
+        var addAssocParamKeys: Set<String> = emptySet()
         var makePrimaryCanary: String? = null
         var removeAliasAction: String? = null
+        val debugPayloads = mutableListOf<String>()
 
         val mockEngine = MockEngine { request ->
             val path = request.url.encodedPath
             when {
+                path == "/proofs/manage/additional" -> {
+                    refreshUserAgent = request.headers[HttpHeaders.UserAgent]
+                    respond(
+                        content = """<html><script>var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net1","apiCanary":"fresh_canary_stage8"}}};</script></html>""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+
                 path == "/AddAssocId" -> {
+                    addAssocHeaderCanary = request.headers["canary"]
+                    addAssocCookieHeader = request.headers[HttpHeaders.Cookie]
+                    addAssocReferer = request.headers["Referer"]
+                    addAssocUserAgent = request.headers[HttpHeaders.UserAgent]
+                    val formData = (request.body as? FormDataContent)?.formData
+                    addAssocParamKeys = formData?.names().orEmpty()
+                    addAssocFormCanary = formData?.get("canary")
+                    addAssocPostOption = formData?.get("PostOption")
+                    addAssocSingleDomain = formData?.get("SingleDomain")
+                    addAssocUpSell = formData?.get("UpSell")
+                    addAssocOptions = formData?.get("AddAssocIdOptions")
+                    addAssocLive = formData?.get("AssociatedIdLive")
+                    addAssocUaid = formData?.get("uaid")
                     respond("<html>Added</html>", HttpStatusCode.OK)
                 }
 
@@ -74,6 +112,7 @@ class AliasClientTest {
 
                 path == "/Aliases/Verify" -> {
                     verifyCookiesHeader = request.headers[HttpHeaders.Cookie]
+                    verifyUserAgent = request.headers[HttpHeaders.UserAgent]
                     assertEquals("mock_otc_token_123", request.url.parameters["otc"])
                     assertEquals("Email", request.url.parameters["aliastype"])
                     respond("<html>Verified</html>", HttpStatusCode.OK)
@@ -112,7 +151,15 @@ class AliasClientTest {
         )
         cookieStorage.addCookie(
             Url("https://account.live.com"),
-            Cookie(name = "amsc", value = "amsc_val", domain = "account.live.com", path = "/", secure = true),
+            Cookie(name = "amsc", value = "amsc_val_secret_1234", domain = "account.live.com", path = "/", secure = true),
+        )
+        cookieStorage.addCookie(
+            Url("https://login.live.com"),
+            Cookie(name = "OParams", value = "stale_oparams_should_not_leak", domain = "login.live.com", path = "/"),
+        )
+        cookieStorage.addCookie(
+            Url("https://login.live.com"),
+            Cookie(name = "uaid", value = "exact_login_cookie_uaid_value", domain = "login.live.com", path = "/"),
         )
 
         val httpClient = HttpClient(mockEngine) {
@@ -132,19 +179,45 @@ class AliasClientTest {
         )
 
         val result = client.rotateAlias(
-            currentCanary = "initial_canary",
+            currentCanary = "stale_canary",
             oldEmail = "old_user@outlook.com",
             httpClient = httpClient,
             customAlias = "ab12cd@qhuyy.tech",
+            sessionUaid = "0123456789abcdef0123456789abcdef",
+            debugListener = { debugPayloads.add(it) },
         )
 
         assertEquals("old_user@outlook.com", result.oldEmail)
         assertEquals("ab12cd@qhuyy.tech", result.newEmail)
         assertEquals("updated_canary_from_make_primary", result.updatedCanary)
+        assertEquals("fresh_canary_stage8", addAssocHeaderCanary)
+        assertEquals("fresh_canary_stage8", addAssocFormCanary)
+        assertEquals("NONE", addAssocPostOption)
+        assertEquals("qhuyy.tech", addAssocSingleDomain)
+        assertEquals("", addAssocUpSell)
+        assertEquals("LIVE", addAssocOptions)
+        assertEquals("ab12cd", addAssocLive)
+        assertEquals("exact_login_cookie_uaid_value", addAssocUaid)
+        assertEquals(
+            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdLive", "uaid"),
+            addAssocParamKeys,
+        )
+        assertEquals("https://account.live.com/proofs/manage/additional", addAssocReferer)
+        assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, refreshUserAgent)
+        assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, addAssocUserAgent)
+        assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, verifyUserAgent)
+        assertTrue(addAssocCookieHeader?.contains("__Host-MSAAUTH=msa_auth_val") == true)
+        assertTrue(addAssocCookieHeader?.contains("AMRPSSecAuth=amrp_val") == true)
+        assertTrue(addAssocCookieHeader?.contains("amsc=amsc_val_secret_1234") == true)
+        assertTrue(addAssocCookieHeader?.contains("OParams") != true)
+        assertTrue(addAssocCookieHeader?.contains("uaid=") != true)
+        assertEquals(1, debugPayloads.size)
+        assertTrue(!debugPayloads.single().contains("fresh_canary_stage8"))
+        assertTrue(!debugPayloads.single().contains("amsc_val_secret_1234"))
         assertTrue(verifyCookiesHeader?.contains("__Host-MSAAUTH=msa_auth_val") == true)
         assertTrue(verifyCookiesHeader?.contains("AMRPSSecAuth=amrp_val") == true)
-        assertTrue(verifyCookiesHeader?.contains("amsc=amsc_val") == true)
-        assertEquals("initial_canary", makePrimaryCanary)
+        assertTrue(verifyCookiesHeader?.contains("amsc=amsc_val_secret_1234") == true)
+        assertEquals("fresh_canary_stage8", makePrimaryCanary)
         assertEquals("RemoveAlias", removeAliasAction)
     }
 
@@ -153,6 +226,10 @@ class AliasClientTest {
         val mockEngine = MockEngine { request ->
             val path = request.url.encodedPath
             when (path) {
+                "/proofs/manage/additional" -> respond(
+                    content = """<html><script>var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net1","apiCanary":"fresh_canary"}}};</script></html>""",
+                    status = HttpStatusCode.OK,
+                )
                 "/AddAssocId" -> respond("<html>Added</html>", HttpStatusCode.OK)
                 "/get-otc" -> respond("Not found", HttpStatusCode.NotFound)
                 else -> error("Unexpected path: $path")
@@ -182,6 +259,10 @@ class AliasClientTest {
         val mockEngine = MockEngine { request ->
             val path = request.url.encodedPath
             when (path) {
+                "/proofs/manage/additional" -> respond(
+                    content = """<html><script>var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net1","apiCanary":"fresh_canary"}}};</script></html>""",
+                    status = HttpStatusCode.OK,
+                )
                 "/AddAssocId" -> respond("<html>Added</html>", HttpStatusCode.OK)
                 "/get-otc" -> respond(
                     content = """{"otc":"token"}""",
@@ -223,6 +304,10 @@ class AliasClientTest {
         val mockEngine = MockEngine { request ->
             val path = request.url.encodedPath
             when (path) {
+                "/proofs/manage/additional" -> respond(
+                    content = """<html><script>var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net1","apiCanary":"fresh_canary"}}};</script></html>""",
+                    status = HttpStatusCode.OK,
+                )
                 "/AddAssocId" -> respond("<html>Added</html>", HttpStatusCode.OK)
                 "/get-otc" -> respond(
                     content = """{"otc":"token"}""",
@@ -279,6 +364,13 @@ class AliasClientTest {
         val mockEngine = MockEngine { request ->
             val path = request.url.encodedPath
             when (path) {
+                "/proofs/manage/additional" -> {
+                    callOrder.add("RefreshCanary")
+                    respond(
+                        content = """<html><script>var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net1","apiCanary":"fresh_canary"}}};</script></html>""",
+                        status = HttpStatusCode.OK,
+                    )
+                }
                 "/AddAssocId" -> {
                     callOrder.add("AddAssocId")
                     respond("<html>Added</html>", HttpStatusCode.OK)
@@ -331,8 +423,135 @@ class AliasClientTest {
         assertEquals("victim@qhuyy.tech", result.newEmail)
         assertEquals("canary_2", result.updatedCanary)
         assertEquals(
-            listOf("AddAssocId", "ManualPrompt:victim@qhuyy.tech", "Verify", "MakePrimary", "RemoveAlias"),
+            listOf("RefreshCanary", "AddAssocId", "ManualPrompt:victim@qhuyy.tech", "Verify", "MakePrimary", "RemoveAlias"),
             callOrder,
         )
+    }
+
+    @Test
+    fun testAddAssocIdRedirectToMicrosoftOnlineThrowsSessionExpiredWithoutFollowingRedirect(): Unit = runBlocking {
+        var redirectFollowed = false
+
+        val mockEngine = MockEngine { request ->
+            val host = request.url.host
+            val path = request.url.encodedPath
+            when {
+                host == "login.microsoftonline.com" -> {
+                    redirectFollowed = true
+                    respond("<html>Should not follow redirect</html>", HttpStatusCode.OK)
+                }
+                path == "/proofs/manage/additional" -> {
+                    respond(
+                        content = """<html><script>var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net1","apiCanary":"fresh_canary_abc"}}};</script></html>""",
+                        status = HttpStatusCode.OK,
+                    )
+                }
+                path == "/AddAssocId" -> {
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://login.microsoftonline.com/common/oauth2/authorize?client_id=00000004",
+                        ),
+                    )
+                }
+                else -> error("Unexpected request: ${request.url}")
+            }
+        }
+
+        val httpClient = MicrosoftHttpClientFactory.create(engine = mockEngine)
+        val client = AliasClient(sharedSecret = "")
+
+        val thrown = assertFailsWith<SessionExpiredException> {
+            client.rotateAlias(
+                currentCanary = "stale_canary",
+                oldEmail = "lencak480@gmail.com",
+                httpClient = httpClient,
+                customAlias = "lencak480@qhuyy.tech",
+            )
+        }
+
+        assertTrue(!redirectFollowed)
+        assertEquals("Session expired during Alias Rotation. Cannot add alias.", thrown.message)
+        assertEquals(
+            "https://login.microsoftonline.com/common/oauth2/authorize?client_id=00000004",
+            thrown.redirectLocation,
+        )
+    }
+
+    @Test
+    fun testAddAssocIdOmitsUaidWhenLoginCookieMissing(): Unit = runBlocking {
+        var addAssocParamKeys: Set<String> = emptySet()
+        var addAssocUaid: String? = "unexpected"
+        var addAssocLive: String? = null
+        val debugPayloads = mutableListOf<String>()
+
+        val mockEngine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/proofs/manage/additional" -> respond(
+                    content = """<html><script>var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net1","apiCanary":"fresh_canary_no_uaid"}}};</script></html>""",
+                    status = HttpStatusCode.OK,
+                )
+                "/AddAssocId" -> {
+                    val formData = (request.body as? FormDataContent)?.formData
+                    addAssocParamKeys = formData?.names().orEmpty()
+                    addAssocUaid = formData?.get("uaid")
+                    addAssocLive = formData?.get("AssociatedIdLive")
+                    respond("<html>Added</html>", HttpStatusCode.OK)
+                }
+                "/Aliases/Verify" -> respond("<html>Verified</html>", HttpStatusCode.OK)
+                "/API/MakePrimary" -> respond(
+                    content = """{"apiCanary":"canary_primary"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+                "/names/manage" -> respond("<html>Note_AssociatedIdRemoved</html>", HttpStatusCode.OK)
+                else -> error("Unexpected path: ${request.url.encodedPath}")
+            }
+        }
+
+        val cookieStorage = AcceptAllCookiesStorage()
+        cookieStorage.addCookie(
+            Url("https://login.live.com"),
+            Cookie(name = "__Host-MSAAUTH", value = "msa_auth_val", domain = "login.live.com", path = "/", secure = true),
+        )
+        cookieStorage.addCookie(
+            Url("https://account.live.com"),
+            Cookie(name = "AMRPSSecAuth", value = "amrp_val", domain = "account.live.com", path = "/", secure = true),
+        )
+        cookieStorage.addCookie(
+            Url("https://account.live.com"),
+            Cookie(name = "amsc", value = "amsc_val", domain = "account.live.com", path = "/", secure = true),
+        )
+
+        val httpClient = HttpClient(mockEngine) {
+            install(HttpCookies) {
+                storage = cookieStorage
+            }
+            install(ContentNegotiation) {
+                json(MicrosoftHttpClientFactory.json)
+            }
+        }
+
+        val client = AliasClient(sharedSecret = "")
+        client.rotateAlias(
+            currentCanary = "stale_canary",
+            oldEmail = "lencak480@gmail.com",
+            httpClient = httpClient,
+            customAlias = "lencak480@qhuyy.tech",
+            aliasOtcProvider = { "112233" },
+            cookieStorage = cookieStorage,
+            sessionUaid = "83f705bc231b49f0922e5e3609ac18fa",
+            debugListener = { debugPayloads.add(it) },
+        )
+
+        assertEquals(null, addAssocUaid)
+        assertEquals("lencak480", addAssocLive)
+        assertEquals(
+            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdLive"),
+            addAssocParamKeys,
+        )
+        assertTrue(debugPayloads.single().contains("uaid=(omitted - no uaid cookie under login.live.com)"))
     }
 }

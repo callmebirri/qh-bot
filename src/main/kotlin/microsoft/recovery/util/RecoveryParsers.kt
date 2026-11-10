@@ -171,6 +171,36 @@ object RecoveryParsers {
         return fallbackTokenTRegex.find(html)?.groupValues?.get(1)
     }
 
+    fun extractApiCanary(html: String, json: Json): String? {
+        val t0Json = extractJsonObjectByRegex(html, t0PrefixRegex)
+            ?: extractJsonObject(html, "var t0 =")
+            ?: extractJsonObject(html, "t0 =")
+        val t0Obj = t0Json?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
+
+        val serverDataJson = extractJsonObjectByRegex(html, serverDataPrefixRegex)
+        val serverDataObj = serverDataJson?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
+
+        val wlxObj = t0Obj?.get("WLXAccount")?.let { runCatching { it.jsonObject }.getOrNull() }
+        val manageProofsObj = wlxObj?.get("manageProofs")?.let { runCatching { it.jsonObject }.getOrNull() }
+            ?: extractJsonObject(html, "\"manageProofs\"")?.let {
+                runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull()
+            }
+
+        val canary = manageProofsObj.stringField("apiCanary")
+            ?: wlxObj.stringField("apiCanary")
+            ?: t0Obj.stringField("apiCanary")
+            ?: serverDataObj.stringField("apiCanary")
+            ?: apiCanaryRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
+            ?: apiCanaryAltRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
+            ?: apiCanaryEscapedRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
+            ?: manageProofsObj.stringField("sCanary", "canary")
+            ?: wlxObj.stringField("sCanary", "canary")
+            ?: t0Obj.stringField("sCanary", "canary")
+            ?: serverDataObj.stringField("sCanary", "canary")
+
+        return canary?.takeIf { it.isNotBlank() }?.let(::unescapeUnicode)
+    }
+
     fun extractManageProofsData(html: String, json: Json): ManageProofsData? {
         val t0Json = extractJsonObjectByRegex(html, t0PrefixRegex)
             ?: extractJsonObject(html, "var t0 =")
@@ -194,17 +224,7 @@ object RecoveryParsers {
             ?: encryptedNetIdAltRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
             ?: encryptedNetIdEscapedRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
 
-        val canary = manageProofsObj.stringField("apiCanary")
-            ?: wlxObj.stringField("apiCanary")
-            ?: t0Obj.stringField("apiCanary")
-            ?: serverDataObj.stringField("apiCanary")
-            ?: apiCanaryRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
-            ?: apiCanaryAltRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
-            ?: apiCanaryEscapedRegex.find(html)?.groupValues?.get(1)?.let { decodeRegexToken(it, json) }
-            ?: manageProofsObj.stringField("sCanary", "canary")
-            ?: wlxObj.stringField("sCanary", "canary")
-            ?: t0Obj.stringField("sCanary", "canary")
-            ?: serverDataObj.stringField("sCanary", "canary")
+        val canary = extractApiCanary(html, json)
 
         if (netId.isNullOrBlank() || canary.isNullOrBlank()) {
             return null

@@ -21,11 +21,13 @@ import io.ktor.client.statement.request
 import io.ktor.http.ContentType
 import io.ktor.http.Cookie
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
 import io.ktor.http.URLBuilder
 import io.ktor.http.Url
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import io.ktor.http.parameters
+import io.ktor.http.parseServerSetCookieHeader
 import io.ktor.http.takeFrom
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -38,6 +40,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import microsoft.recovery.alias.AliasClient
+import microsoft.recovery.alias.SessionExpiredException
 import microsoft.recovery.model.GenerateRecoveryCodeRequest
 import microsoft.recovery.model.GenerateRecoveryCodeResponse
 import microsoft.recovery.model.GenericCanaryResponse
@@ -205,7 +208,9 @@ class RecoveryService(
 
         if (stageDelayMs > 0) delay(stageDelayMs)
 
-        val freshProofsResponse = client.get("https://account.live.com/proofs/manage/additional")
+        val freshProofsResponse = client.get("https://account.live.com/proofs/manage/additional") {
+            header("X-Requested-With", "XMLHttpRequest")
+        }
         val freshProofsData = RecoveryParsers.extractManageProofsData(freshProofsResponse.bodyAsText(), MicrosoftHttpClientFactory.json)
         val emailProofs = freshProofsData?.emailProofs ?: proofsData.emailProofs
         val smsProofs = freshProofsData?.smsProofs ?: proofsData.smsProofs
@@ -228,6 +233,7 @@ class RecoveryService(
 
             val stage8Result = executeStage8(
                 client = client,
+                cookieStorage = cookieStorage,
                 email = email,
                 newEmail = newEmail,
                 uaid = uaid,
@@ -485,39 +491,40 @@ class RecoveryService(
 
             val stabilizationUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$currentUaid&lc=1033&id=38936&mkt=en-US"
 
+            val stage3Storage = Stage3CookiesStorage(cookieStorage)
             val isolatedClient = if (clientEngine != null) {
                 HttpClient(clientEngine) {
                     followRedirects = true
                     install(HttpRedirect) { checkHttpMethod = false }
+                    install(HttpCookies) {
+                        storage = stage3Storage
+                    }
                 }
             } else {
                 HttpClient(OkHttp.create()) {
                     followRedirects = true
                     install(HttpRedirect) { checkHttpMethod = false }
+                    install(HttpCookies) {
+                        storage = stage3Storage
+                    }
                 }
             }
 
-            val polishResponse = isolatedClient.use {
-                it.get(stabilizationUrl) {
-                    header(HttpHeaders.Cookie, cleanCookieHeader)
-                    header(
-                        HttpHeaders.UserAgent,
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    )
-                    header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
-                    header(
-                        HttpHeaders.Accept,
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                    )
-                    header("Sec-Ch-Ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
-                    header("Sec-Ch-Ua-Mobile", "?0")
-                    header("Sec-Ch-Ua-Platform", "\"Windows\"")
-                    header("Sec-Fetch-Dest", "document")
-                    header("Sec-Fetch-Mode", "navigate")
-                    header("Sec-Fetch-Site", "same-site")
-                    header("Sec-Fetch-User", "?1")
-                    header("Upgrade-Insecure-Requests", "1")
-                }
+            val polishResponse = isolatedClient.get(stabilizationUrl) {
+                header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+                header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+                header(
+                    HttpHeaders.Accept,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                )
+                header("Sec-Ch-Ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
+                header("Sec-Ch-Ua-Mobile", "?0")
+                header("Sec-Ch-Ua-Platform", "\"Windows\"")
+                header("Sec-Fetch-Dest", "document")
+                header("Sec-Fetch-Mode", "navigate")
+                header("Sec-Fetch-Site", "same-site")
+                header("Sec-Fetch-User", "?1")
+                header("Upgrade-Insecure-Requests", "1")
             }
 
             val initialUrl = polishResponse.request.url.toString().ifBlank { stabilizationUrl }
@@ -666,18 +673,19 @@ $htmlSnippet
         formFields: List<Pair<String, String>>,
         cookieStorage: CookiesStorage,
     ): io.ktor.client.statement.HttpResponse {
+        val stage3Storage = Stage3CookiesStorage(cookieStorage)
         val noRedirectPostClient = if (clientEngine != null) {
             HttpClient(clientEngine) {
                 followRedirects = false
                 install(HttpCookies) {
-                    storage = cookieStorage
+                    storage = stage3Storage
                 }
             }
         } else {
             HttpClient(OkHttp.create()) {
                 followRedirects = false
                 install(HttpCookies) {
-                    storage = cookieStorage
+                    storage = stage3Storage
                 }
             }
         }
@@ -691,10 +699,7 @@ $htmlSnippet
                     }
                 },
             ) {
-                header(
-                    HttpHeaders.UserAgent,
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                )
+                header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
                 header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
             }
             logger.info(
@@ -733,10 +738,7 @@ $htmlSnippet
                 },
             ) {
                 header(HttpHeaders.Cookie, cleanCookieHeader)
-                header(
-                    HttpHeaders.UserAgent,
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                )
+                header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
                 header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
             }
             logger.info(
@@ -783,7 +785,9 @@ $htmlSnippet
         client: HttpClient,
         stageListener: StageListener?,
     ): StageExecution<ManageProofsData> = try {
-        val manageProofsResponse = client.get("https://account.live.com/proofs/manage/additional")
+        val manageProofsResponse = client.get("https://account.live.com/proofs/manage/additional") {
+            header("X-Requested-With", "XMLHttpRequest")
+        }
         val finalUrl = manageProofsResponse.request.url.toString()
         val manageProofsHtml = manageProofsResponse.bodyAsText()
         val parsedDoc = Jsoup.parse(manageProofsHtml)
@@ -1145,6 +1149,7 @@ Text: $bodyText
 
     private suspend fun executeStage8(
         client: HttpClient,
+        cookieStorage: CookiesStorage,
         email: String,
         newEmail: String,
         uaid: String,
@@ -1162,34 +1167,185 @@ Text: $bodyText
                     currentCanary = activeCanary,
                     oldEmail = email,
                     httpClient = client,
-                    customAlias = if (newEmail.endsWith("@qhuyy.tech")) newEmail else null,
+                    customAlias = if (newEmail.endsWith("@qhuyy.tech", ignoreCase = true)) newEmail else null,
                     aliasOtcProvider = aliasOtcProvider,
+                    cookieStorage = cookieStorage,
+                    sessionUaid = uaid,
+                    debugListener = { detail ->
+                        stageListener?.invoke("8-debug", "Stage 8 Request Debug", true, detail)
+                    },
                 )
             }.getOrElse { e ->
                 if (e is CancellationException) throw e
                 val msg = e.message ?: "Custom domain alias rotation failed"
-                stageListener?.invoke("8", "Alias Rotation", false, msg)
+                val detail = if (e is SessionExpiredException && !e.redirectLocation.isNullOrBlank()) {
+                    "$msg\nLocation: ${e.redirectLocation}"
+                } else {
+                    msg
+                }
+                stageListener?.invoke("8", "Alias Rotation", false, detail)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, msg, cause = e))
             }
             targetAliasEmail = aliasResult.newEmail
             activeCanary = aliasResult.updatedCanary
             stageListener?.invoke("8", "Alias Rotation", true, "Alias $targetAliasEmail verified and set as primary")
         } else {
-            val newAliasPrefix = newEmail.substringBefore("@")
-            targetAliasEmail = "$newAliasPrefix@outlook.com"
+            val targetEmail = if (newEmail.contains("@")) newEmail.trim() else "${newEmail.trim()}@outlook.com"
+            val newAliasPrefix = targetEmail.substringBefore("@")
+            val targetDomain = targetEmail.substringAfter("@")
+            targetAliasEmail = targetEmail
 
-            val addAliasResponse = client.submitForm(
-                url = "https://account.live.com/AddAssocId",
-                formParameters = parameters {
-                    append("canary", activeCanary)
-                    append("PostOption", "NONE")
-                    append("SingleDomain", "outlook.com")
-                    append("AddAssocIdOptions", "LIVE")
-                    append("AssociatedIdLive", newAliasPrefix)
-                },
-            )
-            if (!addAliasResponse.status.isSuccess()) {
-                val msg = "AddAssocId failed: HTTP ${addAliasResponse.status.value}"
+            val noRedirectClient = HttpClient(client.engine) {
+                followRedirects = false
+            }
+
+            val addAliasResult = runCatching {
+                noRedirectClient.use { stageClient ->
+                    val (refreshCookieHeader, _) = buildIsolatedAccountCookieHeader(cookieStorage, "GET /proofs/manage/additional")
+                    val manageResponse = stageClient.get("https://account.live.com/proofs/manage/additional") {
+                        header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+                        header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+                        if (refreshCookieHeader.isNotBlank()) {
+                            header(HttpHeaders.Cookie, refreshCookieHeader)
+                        }
+                    }
+                    for (rawHeader in manageResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()) {
+                        val parsed = runCatching { parseServerSetCookieHeader(rawHeader) }.getOrNull()
+                        if (parsed != null && parsed.name.isNotBlank()) {
+                            cookieStorage.addCookie(
+                                Url("https://account.live.com"),
+                                parsed.copy(domain = parsed.domain ?: "account.live.com", path = parsed.path ?: "/"),
+                            )
+                        }
+                    }
+                    val manageLocation = manageResponse.headers[HttpHeaders.Location]
+                    if ((manageResponse.status == HttpStatusCode.Found ||
+                            manageResponse.status == HttpStatusCode.SeeOther ||
+                            manageResponse.status == HttpStatusCode.TemporaryRedirect) &&
+                        manageLocation != null &&
+                        (manageLocation.contains("login.microsoftonline.com", ignoreCase = true) ||
+                            manageLocation.contains("login.live.com", ignoreCase = true))
+                    ) {
+                        logger.error(
+                            "Stage 8 GET /proofs/manage/additional {} redirect Location before SessionExpiredException: {}",
+                            manageResponse.status.value,
+                            manageLocation,
+                        )
+                        throw SessionExpiredException(
+                            "Session expired during Alias Rotation. Cannot add alias.",
+                            redirectLocation = manageLocation,
+                        )
+                    }
+                    val manageHtml = runCatching { manageResponse.bodyAsText() }.getOrDefault("")
+                    val freshCanary = RecoveryParsers.extractApiCanary(manageHtml, MicrosoftHttpClientFactory.json)
+                    if (!freshCanary.isNullOrBlank()) {
+                        activeCanary = freshCanary
+                    }
+
+                    val actualCookieUaid = cookieStorage.get(Url("https://login.live.com"))
+                        .firstOrNull { it.name == "uaid" }
+                        ?.value
+                        ?.takeIf { it.isNotBlank() }
+
+                    val (addCookieHeader, maskedCookies) = buildIsolatedAccountCookieHeader(cookieStorage, "POST /AddAssocId")
+                    val formPairs = buildList {
+                        add("canary" to activeCanary)
+                        add("PostOption" to "NONE")
+                        add("SingleDomain" to targetDomain)
+                        add("UpSell" to "")
+                        add("AddAssocIdOptions" to "LIVE")
+                        add("AssociatedIdLive" to newAliasPrefix)
+                        if (actualCookieUaid != null) {
+                            add("uaid" to actualCookieUaid)
+                        }
+                    }
+
+                    val maskedHeaders = buildString {
+                        appendLine("canary=${maskSecretValue(activeCanary)}")
+                        appendLine("Referer=https://account.live.com/proofs/manage/additional")
+                        appendLine("Origin=https://account.live.com")
+                        appendLine("User-Agent=${MicrosoftHttpClientFactory.DEFAULT_USER_AGENT}")
+                        appendLine("Accept-Language=en-US,en;q=0.9")
+                        append("Cookie=$maskedCookies")
+                    }
+                    val maskedParams = buildString {
+                        append(
+                            formPairs.joinToString("\n") { (k, v) ->
+                                val display = if (k == "canary") maskSecretValue(v) else if (v.isEmpty()) "(empty)" else v
+                                "$k=$display"
+                            }
+                        )
+                        if (actualCookieUaid == null) {
+                            append("\nuaid=(omitted - no uaid cookie under login.live.com)")
+                        }
+                    }
+
+                    logger.info(
+                        "Stage 8 POST /AddAssocId debug:\nHeaders:\n{}\nForm:\n{}",
+                        maskedHeaders,
+                        maskedParams,
+                    )
+                    stageListener?.invoke(
+                        "8-debug",
+                        "Stage 8 Request Debug",
+                        true,
+                        "**Headers:**\n```text\n$maskedHeaders\n```\n**Form Parameters:**\n```text\n$maskedParams\n```",
+                    )
+
+                    val postResponse = stageClient.submitForm(
+                        url = "https://account.live.com/AddAssocId",
+                        formParameters = parameters {
+                            for ((key, value) in formPairs) {
+                                append(key, value)
+                            }
+                        },
+                    ) {
+                        header("canary", activeCanary)
+                        header("Referer", "https://account.live.com/proofs/manage/additional")
+                        header("Origin", "https://account.live.com")
+                        header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+                        header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+                        if (addCookieHeader.isNotBlank()) {
+                            header(HttpHeaders.Cookie, addCookieHeader)
+                        }
+                    }
+
+                    val addLocation = postResponse.headers[HttpHeaders.Location]
+                    if ((postResponse.status == HttpStatusCode.Found ||
+                            postResponse.status == HttpStatusCode.SeeOther ||
+                            postResponse.status == HttpStatusCode.TemporaryRedirect) &&
+                        addLocation != null &&
+                        addLocation.contains("login.microsoftonline.com", ignoreCase = true)
+                    ) {
+                        logger.error(
+                            "Stage 8 AddAssocId {} redirect Location before SessionExpiredException: {}",
+                            postResponse.status.value,
+                            addLocation,
+                        )
+                        throw SessionExpiredException(
+                            "Session expired during Alias Rotation. Cannot add alias.",
+                            redirectLocation = addLocation,
+                        )
+                    }
+                    postResponse
+                }
+            }.getOrElse { e ->
+                if (e is CancellationException) throw e
+                val msg = e.message ?: "AddAssocId failed"
+                val detail = if (e is SessionExpiredException && !e.redirectLocation.isNullOrBlank()) {
+                    "$msg\nLocation: ${e.redirectLocation}"
+                } else {
+                    msg
+                }
+                stageListener?.invoke("8", "Alias Rotation", false, detail)
+                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, msg, cause = e))
+            }
+
+            if (!addAliasResult.status.isSuccess() &&
+                addAliasResult.status != HttpStatusCode.Found &&
+                addAliasResult.status != HttpStatusCode.SeeOther
+            ) {
+                val msg = "AddAssocId failed: HTTP ${addAliasResult.status.value}"
                 stageListener?.invoke("8", "Alias Rotation", false, msg)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, msg))
             }
@@ -1236,7 +1392,9 @@ Text: $bodyText
                     append("displayName", email)
                 },
             )
-            if (!removeAliasResponse.status.isSuccess()) {
+            val removeAliasHtml = runCatching { removeAliasResponse.bodyAsText() }.getOrDefault("")
+            val confirmed = removeAliasHtml.contains("Note_AssociatedIdRemoved")
+            if (!confirmed && !removeAliasResponse.status.isSuccess()) {
                 val msg = "RemoveAlias failed: HTTP ${removeAliasResponse.status.value}"
                 stageListener?.invoke("8", "Alias Rotation", false, msg)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, msg))
@@ -1245,6 +1403,44 @@ Text: $bodyText
         }
 
         return StageExecution.Success(Pair(targetAliasEmail, activeCanary))
+    }
+
+    private fun maskSecretValue(value: String): String {
+        if (value.isEmpty()) return "(empty)"
+        if (value.length <= 8) return "*** (len=${value.length})"
+        return "${value.take(4)}...${value.takeLast(4)} (len=${value.length})"
+    }
+
+    private suspend fun buildIsolatedAccountCookieHeader(
+        cookieStorage: CookiesStorage,
+        operationName: String,
+    ): Pair<String, String> {
+        val merged = linkedMapOf<String, Cookie>()
+        for (cookie in cookieStorage.get(Url("https://login.live.com"))) {
+            merged[cookie.name] = cookie
+        }
+        for (cookie in cookieStorage.get(Url("https://account.live.com"))) {
+            merged[cookie.name] = cookie
+        }
+
+        val requiredNames = listOf("__Host-MSAAUTH", "AMRPSSecAuth", "amsc")
+        val isolated = requiredNames.mapNotNull { name ->
+            merged[name]?.takeIf { it.value.isNotBlank() }?.let { name to it.value }
+        }
+        val missing = requiredNames.filter { name -> isolated.none { it.first == name } }
+        val maskedSummary = if (isolated.isEmpty()) {
+            "(none; missing=${missing.joinToString(",")})"
+        } else {
+            val attached = isolated.joinToString("; ") { (name, value) -> "$name=${maskSecretValue(value)}" }
+            if (missing.isEmpty()) attached else "$attached | missing=${missing.joinToString(",")}"
+        }
+        logger.info(
+            "Stage 8 cookie isolation for {}: {}, allStorageCookieNames={}",
+            operationName,
+            maskedSummary,
+            merged.keys.joinToString(","),
+        )
+        return isolated.joinToString("; ") { (name, value) -> "$name=$value" } to maskedSummary
     }
 
     private suspend fun executeStage9(
@@ -1332,5 +1528,20 @@ Text: $bodyText
     private sealed class StageExecution<out T> {
         data class Success<out T>(val value: T) : StageExecution<T>()
         data class Failure(val result: RecoveryResult.Failure) : StageExecution<Nothing>()
+    }
+
+    private class Stage3CookiesStorage(
+        private val delegate: CookiesStorage,
+    ) : CookiesStorage {
+        override suspend fun get(requestUrl: Url): List<Cookie> {
+            return delegate.get(requestUrl).filter { it.name !in setOf("OParams", "PPState") }
+        }
+
+        override suspend fun addCookie(requestUrl: Url, cookie: Cookie) {
+            delegate.addCookie(requestUrl, cookie)
+        }
+
+        override fun close() {
+        }
     }
 }

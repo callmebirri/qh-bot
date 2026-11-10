@@ -286,7 +286,7 @@ class RecoveryServiceTest {
                 }
 
                 path == "/names/manage" -> {
-                    respond("<html>Alias removed</html>", HttpStatusCode.OK)
+                    respond("<html>Note_AssociatedIdRemoved</html>", HttpStatusCode.OK)
                 }
 
                 path == "/API/Proofs/DisableTfa" ||
@@ -768,7 +768,7 @@ class RecoveryServiceTest {
         assertIs<RecoveryResult.Failure>(result)
         assertEquals(RecoveryStage.PROOFS_ENUMERATION, result.stage)
         assertTrue(!redirectTargetHit)
-        assertEquals(null, stage4XRequestedWith)
+        assertEquals("XMLHttpRequest", stage4XRequestedWith)
         assertNotNull(stage4Cookie)
         assertTrue(stage4Cookie!!.contains("AMRPSSecAuth=amrp_tok"))
         assertTrue(stage4Cookie!!.contains("amsc=amsc_tok"))
@@ -958,7 +958,7 @@ class RecoveryServiceTest {
 
         assertIs<RecoveryResult.Success>(result)
         assertEquals("john.doe@qhuyy.tech", result.newPrimaryEmail)
-        assertEquals("john.doe@qhuyy.tech", capturedAddAliasBody)
+        assertEquals("john.doe", capturedAddAliasBody)
 
         assertNotNull(capturedVerifyJson)
         val verifyObj = MicrosoftHttpClientFactory.json.parseToJsonElement(capturedVerifyJson!!).jsonObject
@@ -1265,5 +1265,185 @@ class RecoveryServiceTest {
         assertEquals("INTERMEDIATE_CODE_99", intermediatePostField)
         assertTrue(intermediateCookie?.contains("__Host-MSAAUTH=") == true)
         assertEquals("POST_INTERMEDIATE_TOKEN_T", addProofToken)
+    }
+
+    @Test
+    fun testStage8AddAssocIdRedirectToLoginMicrosoftOnlineFailsCleanly(): Unit = runBlocking {
+        var followedMicrosoftOnline = false
+        var manageProofsCalls = 0
+        var addAssocHeaderCanary: String? = null
+        var addAssocAssociatedIdLive: String? = null
+        var addAssocCookie: String? = null
+        var addAssocReferer: String? = null
+        var addAssocUserAgent: String? = null
+        var addAssocFormCanary: String? = null
+        var addAssocUaid: String? = "unexpected"
+        var addAssocParamKeys: Set<String> = emptySet()
+        val stage8DebugDetails = mutableListOf<String>()
+        val stage8FailureDetails = mutableListOf<String>()
+
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            val host = request.url.host
+            val path = request.url.encodedPath
+            when {
+                host == "login.microsoftonline.com" -> {
+                    followedMicrosoftOnline = true
+                    respond("<html>Should never follow redirect</html>", HttpStatusCode.OK)
+                }
+                path == "/proofs/manage/additional" -> {
+                    manageProofsCalls++
+                    val canary = if (manageProofsCalls >= 3) "refreshed_stage8_canary" else "canary_token_stage4"
+                    respond(
+                        content = """
+                            <html><script>
+                            var t0 = {"WLXAccount":{"manageProofs":{"encryptedNetId":"net_id_123","apiCanary":"$canary","emailProofs":[],"smsProofs":[],"passKeys":[]}}};
+                            </script></html>
+                        """.trimIndent(),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+                path == "/AddAssocId" -> {
+                    addAssocHeaderCanary = request.headers["canary"]
+                    addAssocCookie = request.headers[HttpHeaders.Cookie]
+                    addAssocReferer = request.headers["Referer"]
+                    addAssocUserAgent = request.headers[HttpHeaders.UserAgent]
+                    val form = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData
+                    addAssocParamKeys = form?.names().orEmpty()
+                    addAssocAssociatedIdLive = form?.get("AssociatedIdLive")
+                    addAssocFormCanary = form?.get("canary")
+                    addAssocUaid = form?.get("uaid")
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
+                        ),
+                    )
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            aliasClient = AliasClient(sharedSecret = "secret"),
+        )
+        val result = service.runLifecycle(
+            email = "lencak480@gmail.com",
+            otpProvider = { "123456" },
+            stageListener = { stageKey, _, isSuccess, detail ->
+                if (stageKey == "8-debug") stage8DebugDetails.add(detail)
+                if (stageKey == "8" && !isSuccess) stage8FailureDetails.add(detail)
+            },
+        )
+
+        assertIs<RecoveryResult.Failure>(result)
+        assertEquals(RecoveryStage.ALIAS_ROTATION, result.stage)
+        assertTrue(!followedMicrosoftOnline)
+        assertEquals("refreshed_stage8_canary", addAssocHeaderCanary)
+        assertEquals("refreshed_stage8_canary", addAssocFormCanary)
+        assertEquals("lencak480", addAssocAssociatedIdLive)
+        assertEquals(null, addAssocUaid)
+        assertTrue(!addAssocParamKeys.contains("uaid"))
+        assertEquals(1, stage8DebugDetails.size)
+        assertTrue(!stage8DebugDetails.single().contains("refreshed_stage8_canary"))
+        assertTrue(stage8DebugDetails.single().contains("uaid=(omitted - no uaid cookie under login.live.com)"))
+        assertEquals("https://account.live.com/proofs/manage/additional", addAssocReferer)
+        assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, addAssocUserAgent)
+        assertTrue(addAssocCookie?.contains("AMRPSSecAuth=") == true)
+        assertTrue(addAssocCookie?.contains("amsc=") == true)
+        assertTrue(addAssocCookie?.contains("__Host-MSAAUTH=") == true)
+        assertTrue(result.message.contains("Session expired during Alias Rotation"))
+        assertTrue(
+            stage8FailureDetails.single().contains(
+                "Location: https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
+            ),
+        )
+    }
+
+    @Test
+    fun testStage8AddAssocIdUsesExactUaidCookieFromLoginLiveCom(): Unit = runBlocking {
+        var addAssocUaid: String? = null
+        var addAssocCookie: String? = null
+        var addAssocParamKeys: Set<String> = emptySet()
+
+        val baseEngine = createMockEngine(extraCookies = true)
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/AddAssocId" -> {
+                    addAssocCookie = request.headers[HttpHeaders.Cookie]
+                    val form = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData
+                    addAssocParamKeys = form?.names().orEmpty()
+                    addAssocUaid = form?.get("uaid")
+                    respond("<html>Added</html>", HttpStatusCode.OK)
+                }
+                "/get-otc" -> respond(
+                    content = """{"otc":"112233"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+                "/Aliases/Verify" -> respond("<html>Verified</html>", HttpStatusCode.OK)
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            aliasClient = AliasClient(sharedSecret = "secret", pollIntervalMs = 1L, timeoutMs = 500L),
+            stopAfterStage7 = false,
+        )
+        val result = service.runLifecycle(
+            email = "lencak480@gmail.com",
+            otpProvider = { "123456" },
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertEquals("lencak480@qhuyy.tech", result.newPrimaryEmail)
+        assertEquals("server_uaid_9999", addAssocUaid)
+        assertTrue(addAssocParamKeys.contains("uaid"))
+        assertTrue(addAssocCookie?.contains("uaid=") != true)
+    }
+
+    @Test
+    fun testStage8FallbackBranchOmitsRandomUaidWhenCookieMissing(): Unit = runBlocking {
+        var addAssocUaid: String? = "unexpected"
+        var addAssocParamKeys: Set<String> = emptySet()
+        var addAssocLive: String? = null
+
+        val baseEngine = createMockEngine(extraCookies = false)
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/AddAssocId" -> {
+                    val form = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData
+                    addAssocParamKeys = form?.names().orEmpty()
+                    addAssocUaid = form?.get("uaid")
+                    addAssocLive = form?.get("AssociatedIdLive")
+                    respond("<html>Added</html>", HttpStatusCode.OK)
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            aliasClient = null,
+            stopAfterStage7 = false,
+        )
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newEmail = "custom_fallback@outlook.com",
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertEquals("custom_fallback", addAssocLive)
+        assertEquals(null, addAssocUaid)
+        assertTrue(!addAssocParamKeys.contains("uaid"))
     }
 }
