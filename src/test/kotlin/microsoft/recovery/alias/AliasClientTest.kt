@@ -249,4 +249,14 @@ class AliasClientTest {
             )
         }
     }
+
+    @Test
+    fun testGenerateAliasFromEmail() {
+        val client = AliasClient(domain = "qhuyy.tech")
+        assertEquals("john.doe@qhuyy.tech", client.generateAliasFromEmail("john.doe@gmail.com"))
+        assertEquals("johnspam123@qhuyy.tech", client.generateAliasFromEmail("John+Spam_123!@hotmail.com"))
+        val fallback = client.generateAliasFromEmail("+++@gmail.com")
+        assertTrue(fallback.endsWith("@qhuyy.tech"))
+        assertTrue(fallback.substringBefore("@").isNotEmpty())
+    }
 }

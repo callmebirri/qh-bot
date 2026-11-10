@@ -88,6 +88,7 @@ data class RecoverUserRequest(
 data class RecoverUserResponse(
     val recoveryCode: String? = null,
     val apiCanary: String? = null,
+    val enableTfa: Boolean? = null,
     val error: RecoveryErrorData? = null,
 )
 

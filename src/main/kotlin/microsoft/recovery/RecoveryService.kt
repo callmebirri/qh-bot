@@ -9,12 +9,15 @@ import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpRedirect
 import io.ktor.client.plugins.cookies.AcceptAllCookiesStorage
 import io.ktor.client.plugins.cookies.CookiesStorage
+import io.ktor.client.plugins.cookies.HttpCookies
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.get
 import io.ktor.client.request.header
+import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
+import io.ktor.client.statement.request
 import io.ktor.http.ContentType
 import io.ktor.http.Cookie
 import io.ktor.http.HttpHeaders
@@ -25,7 +28,11 @@ import io.ktor.http.isSuccess
 import io.ktor.http.parameters
 import io.ktor.http.takeFrom
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
@@ -54,6 +61,7 @@ import microsoft.recovery.util.RecoveryParsers
 import org.jsoup.Jsoup
 import org.slf4j.LoggerFactory
 import java.security.SecureRandom
+import kotlin.time.Duration.Companion.milliseconds
 
 typealias StageListener = suspend (stageKey: String, stageName: String, isSuccess: Boolean, detail: String) -> Unit
 
@@ -62,6 +70,7 @@ class RecoveryService(
     private val stageDelayMs: Long = 1000L,
     private val accountRepository: AccountRepository? = null,
     private val aliasClient: AliasClient? = null,
+    private val stopAfterStage7: Boolean = true,
 ) : AutoCloseable {
 
     private val logger = LoggerFactory.getLogger(RecoveryService::class.java)
@@ -81,15 +90,17 @@ class RecoveryService(
             return RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, "Email cannot be blank")
         }
 
-        val targetPassword = if (!newPassword.isNullOrBlank()) {
-            newPassword
-        } else {
-            val length = secureRandom.nextInt(5) + 12
-            RecoveryParsers.generateRandomPassword(length)
-        }
+        val trimmedEmail = email.trim()
+        val targetPassword = newPassword
+            ?.let(RecoveryParsers::sanitizePassword)
+            ?.takeIf { it.isNotBlank() }
+            ?: run {
+                val length = secureRandom.nextInt(5) + 12
+                RecoveryParsers.generateRandomPassword(length)
+            }
 
-        val effectiveNewEmail = newEmail?.trim()
-            ?: aliasClient?.generateRandomAlias()
+        val effectiveNewEmail = newEmail?.trim()?.takeIf { it.isNotEmpty() }
+            ?: aliasClient?.generateAliasFromEmail(trimmedEmail)
             ?: "recov_${RecoveryParsers.generateUaid().take(8)}@outlook.com"
 
         val cookieStorage = AcceptAllCookiesStorage()
@@ -103,7 +114,7 @@ class RecoveryService(
             executeLifecycle(
                 client = client,
                 cookieStorage = cookieStorage,
-                email = email.trim(),
+                email = trimmedEmail,
                 otpProvider = otpProvider,
                 newPassword = targetPassword,
                 newEmail = effectiveNewEmail,
@@ -114,7 +125,7 @@ class RecoveryService(
         } catch (e: Exception) {
             logger.error("Unhandled exception during lifecycle automation: {}", e.message, e)
             val msg = if (e.message?.contains("Max send count", ignoreCase = true) == true) {
-                "Network timeout or Microsoft rate limit hit"
+                "Network timeout or Microsoft rate limit hit: ${e.message}"
             } else {
                 "Lifecycle failed with unexpected exception: ${e.message}"
             }
@@ -191,9 +202,7 @@ class RecoveryService(
 
         if (stageDelayMs > 0) delay(stageDelayMs)
 
-        val freshProofsResponse = client.get("https://account.live.com/proofs/manage/additional") {
-            header("X-Requested-With", "XMLHttpRequest")
-        }
+        val freshProofsResponse = client.get("https://account.live.com/proofs/manage/additional")
         val freshProofsData = RecoveryParsers.extractManageProofsData(freshProofsResponse.bodyAsText(), MicrosoftHttpClientFactory.json)
         val emailProofs = freshProofsData?.emailProofs ?: proofsData.emailProofs
         val smsProofs = freshProofsData?.smsProofs ?: proofsData.smsProofs
@@ -207,16 +216,23 @@ class RecoveryService(
         val (suppressedCount, canaryAfter7) = (stage7Result as StageExecution.Success).value
         activeCanary = canaryAfter7
 
-        if (stageDelayMs > 0) delay(stageDelayMs)
+        val targetAliasEmail: String
+        if (stopAfterStage7) {
+            logger.info("Debug mode: stopping after Stage 7 and marking {} as SUCCESS", email)
+            targetAliasEmail = email
+        } else {
+            if (stageDelayMs > 0) delay(stageDelayMs)
 
-        val stage8Result = executeStage8(client, email, newEmail, uaid, activeCanary, stageListener)
-        if (stage8Result is StageExecution.Failure) return stage8Result.result
-        val (targetAliasEmail, canaryAfter8) = (stage8Result as StageExecution.Success).value
-        activeCanary = canaryAfter8
+            val stage8Result = executeStage8(client, email, newEmail, uaid, activeCanary, stageListener)
+            if (stage8Result is StageExecution.Failure) return stage8Result.result
+            val (rotatedAliasEmail, canaryAfter8) = (stage8Result as StageExecution.Success).value
+            targetAliasEmail = rotatedAliasEmail
+            activeCanary = canaryAfter8
 
-        if (stageDelayMs > 0) delay(stageDelayMs)
+            if (stageDelayMs > 0) delay(stageDelayMs)
 
-        executeStage9(client, uaid, passKeyIds, activeCanary, stageListener)
+            executeStage9(client, uaid, passKeyIds, activeCanary, stageListener)
+        }
 
         accountRepository?.let { repo ->
             try {
@@ -373,7 +389,7 @@ class RecoveryService(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        val msg = "Network timeout or Microsoft rate limit hit"
+        val msg = "Network timeout or Microsoft rate limit hit: ${e.message}"
         stageListener?.invoke("2", "OTP Dispatch", false, msg)
         StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.OTP_DISPATCH, msg, cause = e))
     }
@@ -421,10 +437,6 @@ class RecoveryService(
                     Url("https://login.live.com"),
                     Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "login.live.com", path = "/", secure = true),
                 )
-                cookieStorage.addCookie(
-                    Url("https://account.live.com"),
-                    Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "account.live.com", path = "/", secure = true),
-                )
 
                 stageListener?.invoke("2b", "OTP Submit", true, "__Host-MSAAUTH received")
                 StageExecution.Success(Unit)
@@ -433,7 +445,7 @@ class RecoveryService(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        val msg = "Network timeout or Microsoft rate limit hit"
+        val msg = "Network timeout or Microsoft rate limit hit: ${e.message}"
         stageListener?.invoke("2b", "OTP Submit", false, msg)
         StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_ESTABLISHMENT, msg, cause = e))
     }
@@ -548,21 +560,52 @@ $htmlSnippet
                     StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
                 }
             } else {
-                val addProofResponse = client.submitForm(
-                    url = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
-                    formParameters = parameters { append("t", tokenT) },
+                val noRedirectPostClient = if (clientEngine != null) {
+                    HttpClient(clientEngine) {
+                        followRedirects = false
+                        install(HttpCookies) {
+                            storage = cookieStorage
+                        }
+                    }
+                } else {
+                    HttpClient(OkHttp.create()) {
+                        followRedirects = false
+                        install(HttpCookies) {
+                            storage = cookieStorage
+                        }
+                    }
+                }
+
+                val addProofResponse = noRedirectPostClient.use {
+                    it.submitForm(
+                        url = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
+                        formParameters = parameters { append("t", tokenT) },
+                    ) {
+                        header(
+                            HttpHeaders.UserAgent,
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        )
+                        header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+                    }
+                }
+
+                logger.info(
+                    "Stage 3 POST /proofs/Add status={}, location={}",
+                    addProofResponse.status,
+                    addProofResponse.headers[HttpHeaders.Location] ?: "none",
                 )
 
+                val existingAccountCookies = cookieStorage.get(Url("https://account.live.com"))
                 val setCookieHeaders = addProofResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()
                 for (rawCookie in setCookieHeaders) {
-                    if (rawCookie.contains("AMRPSSecAuth=")) {
+                    if (rawCookie.contains("AMRPSSecAuth=") && existingAccountCookies.none { it.name == "AMRPSSecAuth" }) {
                         val value = rawCookie.substringAfter("AMRPSSecAuth=").substringBefore(";")
                         cookieStorage.addCookie(
                             Url("https://account.live.com"),
                             Cookie(name = "AMRPSSecAuth", value = value, domain = "account.live.com", path = "/", secure = true),
                         )
                     }
-                    if (rawCookie.contains("amsc=")) {
+                    if (rawCookie.contains("amsc=") && existingAccountCookies.none { it.name == "amsc" }) {
                         val value = rawCookie.substringAfter("amsc=").substringBefore(";")
                         cookieStorage.addCookie(
                             Url("https://account.live.com"),
@@ -590,7 +633,7 @@ $htmlSnippet
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        val msg = "Network timeout or Microsoft rate limit hit"
+        val msg = "Network timeout or Microsoft rate limit hit: ${e.message}"
         stageListener?.invoke("3", "Session Polish", false, msg)
         StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg, cause = e))
     }
@@ -598,20 +641,60 @@ $htmlSnippet
     private suspend fun executeStage4(
         client: HttpClient,
         stageListener: StageListener?,
-    ): StageExecution<ManageProofsData> {
-        val manageProofsResponse = client.get("https://account.live.com/proofs/manage/additional") {
-            header("X-Requested-With", "XMLHttpRequest")
-        }
+    ): StageExecution<ManageProofsData> = try {
+        val manageProofsResponse = client.get("https://account.live.com/proofs/manage/additional")
+        val finalUrl = manageProofsResponse.request.url.toString()
         val manageProofsHtml = manageProofsResponse.bodyAsText()
-        val proofsData = RecoveryParsers.extractManageProofsData(manageProofsHtml, MicrosoftHttpClientFactory.json)
-            ?: run {
-                val msg = "Failed to extract encryptedNetId or apiCanary from additional proofs page"
-                stageListener?.invoke("4", "Proofs Enumeration", false, msg)
-                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PROOFS_ENUMERATION, msg))
-            }
+        val parsedDoc = Jsoup.parse(manageProofsHtml)
+        val htmlTitle = parsedDoc.title()
+        val hasT0 = manageProofsHtml.contains("t0")
+        val hasManageProofs = manageProofsHtml.contains("manageProofs")
+        val hasServerData = manageProofsHtml.contains("ServerData")
+        val hasEncryptedNetId = manageProofsHtml.contains("encryptedNetId")
+        val hasApiCanary = manageProofsHtml.contains("apiCanary")
+        val hasPpft = manageProofsHtml.contains("PPFT")
 
-        stageListener?.invoke("4", "Proofs Enumeration", true, "encryptedNetId received")
-        return StageExecution.Success(proofsData)
+        logger.info(
+            "Stage 4 response: status={}, url={}, title={}, length={}, hasT0={}, hasManageProofs={}, hasServerData={}, hasEncryptedNetId={}, hasApiCanary={}, hasPpft={}",
+            manageProofsResponse.status,
+            finalUrl,
+            htmlTitle,
+            manageProofsHtml.length,
+            hasT0,
+            hasManageProofs,
+            hasServerData,
+            hasEncryptedNetId,
+            hasApiCanary,
+            hasPpft,
+        )
+
+        val proofsData = RecoveryParsers.extractManageProofsData(manageProofsHtml, MicrosoftHttpClientFactory.json)
+        if (proofsData == null) {
+            val htmlSnippet = manageProofsHtml.take(500).replace("\r", "").replace("\n", " ")
+            val bodyText = parsedDoc.body().text().take(300)
+            val debugDetail = """
+Status: `${manageProofsResponse.status}` | Title: `$htmlTitle` | Length: `${manageProofsHtml.length}`
+URL: `$finalUrl` | Location: `${manageProofsResponse.headers[HttpHeaders.Location] ?: "none"}`
+Keys: t0=`$hasT0`, manageProofs=`$hasManageProofs`, ServerData=`$hasServerData`, encryptedNetId=`$hasEncryptedNetId`, apiCanary=`$hasApiCanary`, PPFT=`$hasPpft`
+```html
+$htmlSnippet
+```
+Text: $bodyText
+            """.trimIndent()
+            logger.error("Stage 4 extraction failed. {}", debugDetail)
+            val msg = "Failed to extract encryptedNetId or apiCanary from additional proofs page"
+            stageListener?.invoke("4", "Proofs Enumeration", false, "$msg\n$debugDetail")
+            StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PROOFS_ENUMERATION, msg))
+        } else {
+            stageListener?.invoke("4", "Proofs Enumeration", true, "encryptedNetId received")
+            StageExecution.Success(proofsData)
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        val msg = "Network timeout or Microsoft rate limit hit: ${e.message}"
+        stageListener?.invoke("4", "Proofs Enumeration", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PROOFS_ENUMERATION, msg, cause = e))
     }
 
     private suspend fun executeStage5(
@@ -641,6 +724,37 @@ $htmlSnippet
         return StageExecution.Success(Pair(initialRecoveryCode, updatedCanary))
     }
 
+    private suspend fun markPasswordRotationFailed(email: String, reason: String) {
+        accountRepository?.let { repo ->
+            try {
+                repo.updateStatus(email, RecoveredAccount.STATUS_FAILED, reason)
+            } catch (err: Exception) {
+                if (err is CancellationException) throw err
+                logger.error("Failed to mark account FAILED for {}: {}", email, err.message, err)
+            }
+        }
+    }
+
+    private fun extractErrorDetails(rawJson: JsonObject?, typedError: microsoft.recovery.model.RecoveryErrorData?): Pair<String?, String?>? {
+        if (typedError != null) {
+            return Pair(typedError.code, typedError.message ?: typedError.code)
+        }
+        val errorElement = rawJson?.get("error") ?: rawJson?.get("Error") ?: return null
+        if (errorElement is JsonNull) return null
+        return when (errorElement) {
+            is JsonObject -> {
+                val code = errorElement["code"]?.jsonPrimitive?.contentOrNull
+                    ?: errorElement["Code"]?.jsonPrimitive?.contentOrNull
+                val message = errorElement["message"]?.jsonPrimitive?.contentOrNull
+                    ?: errorElement["Message"]?.jsonPrimitive?.contentOrNull
+                    ?: code
+                    ?: errorElement.toString()
+                Pair(code, message)
+            }
+            else -> Pair(null, runCatching { errorElement.jsonPrimitive.contentOrNull }.getOrNull() ?: errorElement.toString())
+        }
+    }
+
     private suspend fun executeStage6(
         client: HttpClient,
         email: String,
@@ -649,12 +763,16 @@ $htmlSnippet
         initialRecoveryCode: String,
         canary: String,
         stageListener: StageListener?,
-    ): StageExecution<Pair<String, String>> {
-        val resetPageResponse = client.get("https://account.live.com/ResetPassword.aspx?wreply=https://login.live.com/oauth20_authorize.srf&mn=$email")
+    ): StageExecution<Pair<String, String>> = try {
+        val resetPageResponse = client.get("https://account.live.com/ResetPassword.aspx") {
+            parameter("wreply", "https://login.live.com/oauth20_authorize.srf")
+            parameter("mn", email)
+        }
         val resetHtml = resetPageResponse.bodyAsText()
         val resetData = RecoveryParsers.extractResetPasswordData(resetHtml, MicrosoftHttpClientFactory.json)
             ?: run {
                 val msg = "Failed to extract sRecoveryToken or reset canary from reset password page"
+                markPasswordRotationFailed(email, msg)
                 stageListener?.invoke("6", "Password Reset", false, msg)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg))
             }
@@ -667,43 +785,86 @@ $htmlSnippet
                     recoveryCode = initialRecoveryCode,
                     code = initialRecoveryCode,
                     token = resetData.sRecoveryToken,
-                )
+                ),
             )
         }
 
-        val verifyData = runCatching { verifyCodeResponse.body<VerifyRecoveryCodeResponse>() }.getOrNull()
+        val verifyRaw = verifyCodeResponse.bodyAsText()
+        val verifyData = runCatching {
+            MicrosoftHttpClientFactory.json.decodeFromString<VerifyRecoveryCodeResponse>(verifyRaw)
+        }.getOrNull()
+        val verifyJson = runCatching {
+            MicrosoftHttpClientFactory.json.parseToJsonElement(verifyRaw).jsonObject
+        }.getOrNull()
+        val verifyError = extractErrorDetails(verifyJson, verifyData?.error)
         val verificationGrantToken = verifyData?.token
-        if (verificationGrantToken.isNullOrBlank()) {
-            val msg = "Failed to verify recovery code: ${verifyData?.error?.message ?: verifyCodeResponse.bodyAsText()}"
+
+        if (!verifyCodeResponse.status.isSuccess() || verifyError != null || verificationGrantToken.isNullOrBlank()) {
+            val msg = "Failed to verify recovery code: ${verifyError?.second ?: "HTTP ${verifyCodeResponse.status.value} $verifyRaw"}"
+            markPasswordRotationFailed(email, msg)
             stageListener?.invoke("6", "Password Reset", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg, verifyData?.error?.code))
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg, verifyError?.first))
         }
 
-        val canaryAfterVerify = verifyData.apiCanary?.takeIf { it.isNotBlank() } ?: canary
+        val canaryAfterVerify = verifyData.apiCanary?.takeIf { it.isNotBlank() } ?: resetData.apiCanary
+        val contactEmailForReset = email.ifBlank { newEmail }
 
         val recoverUserResponse = client.post("https://account.live.com/API/Recovery/RecoverUser") {
             contentType(ContentType.Application.Json)
             header("canary", canaryAfterVerify)
             setBody(
                 RecoverUserRequest(
-                    contactEmail = newEmail,
+                    contactEmail = contactEmailForReset,
+                    contactEpid = "",
                     password = newPassword,
+                    passwordExpiryEnabled = 0,
                     token = verificationGrantToken,
-                )
+                ),
             )
         }
 
-        val recoverUserData = runCatching { recoverUserResponse.body<RecoverUserResponse>() }.getOrNull()
+        val recoverRaw = recoverUserResponse.bodyAsText()
+        val recoverUserData = runCatching {
+            MicrosoftHttpClientFactory.json.decodeFromString<RecoverUserResponse>(recoverRaw)
+        }.getOrNull()
+        val recoverJson = runCatching {
+            MicrosoftHttpClientFactory.json.parseToJsonElement(recoverRaw).jsonObject
+        }.getOrNull()
+        val recoverError = extractErrorDetails(recoverJson, recoverUserData?.error)
         val finalRecoveryCode = recoverUserData?.recoveryCode
-        if (finalRecoveryCode.isNullOrBlank()) {
-            val msg = "Failed to recover user credentials: ${recoverUserData?.error?.message ?: recoverUserResponse.bodyAsText()}"
+
+        logger.info(
+            "Stage 6 RecoverUser response: status={}, enableTfa={}, hasError={}, hasNewRecoveryCode={}",
+            recoverUserResponse.status,
+            recoverUserData?.enableTfa,
+            recoverError != null,
+            !finalRecoveryCode.isNullOrBlank() && finalRecoveryCode != initialRecoveryCode,
+        )
+
+        if (!recoverUserResponse.status.isSuccess() || recoverError != null || finalRecoveryCode.isNullOrBlank()) {
+            val msg = "Failed to recover user credentials: ${recoverError?.second ?: "HTTP ${recoverUserResponse.status.value} $recoverRaw"}"
+            markPasswordRotationFailed(email, msg)
             stageListener?.invoke("6", "Password Reset", false, msg)
-            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg, recoverUserData?.error?.code))
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg, recoverError?.first))
+        }
+
+        if (finalRecoveryCode == initialRecoveryCode) {
+            val msg = "RecoverUser returned unchanged recoveryCode; password update could not be verified"
+            markPasswordRotationFailed(email, msg)
+            stageListener?.invoke("6", "Password Reset", false, msg)
+            return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg))
         }
 
         stageListener?.invoke("6", "Password Reset", true, "Password changed & new code")
         val canaryAfterRecover = recoverUserData.apiCanary?.takeIf { it.isNotBlank() } ?: canaryAfterVerify
-        return StageExecution.Success(Pair(finalRecoveryCode, canaryAfterRecover))
+        StageExecution.Success(Pair(finalRecoveryCode, canaryAfterRecover))
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        val msg = "Password reset request failed: ${e.message}"
+        markPasswordRotationFailed(email, msg)
+        stageListener?.invoke("6", "Password Reset", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.PASSWORD_ROTATION, msg, cause = e))
     }
 
     private suspend fun executeStage7(
@@ -884,12 +1045,16 @@ $htmlSnippet
             header("X-Requested-With", "XMLHttpRequest")
             setBody(SecurityCleanupRequest(uaid = uaid))
         }
-        val deleteDevicesData = runCatching { deleteDevicesResponse.body<GenericCanaryResponse>() }.getOrNull()
+        val deleteDevicesData = runCatching { deleteDevicesResponse.body<GenericCanaryResponse>() }.onFailure {
+            if (it is CancellationException) {
+                currentCoroutineContext().ensureActive()
+            }
+        }.getOrNull()
         if (!deleteDevicesData?.apiCanary.isNullOrBlank()) {
             activeCanary = deleteDevicesData.apiCanary
         }
 
-        if (stageDelayMs > 0) delay(stageDelayMs)
+        if (stageDelayMs > 0) delay(stageDelayMs.milliseconds)
 
         val deleteAppPasswordResponse = client.post("https://account.live.com/API/Proofs/DeleteAppPassword") {
             contentType(ContentType.Application.Json)

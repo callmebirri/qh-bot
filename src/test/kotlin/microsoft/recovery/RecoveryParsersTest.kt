@@ -141,4 +141,48 @@ class RecoveryParsersTest {
         assertEquals("recovery_token_val+abc", data.sRecoveryToken)
         assertEquals("reset_canary_val+def", data.apiCanary)
     }
+
+    @Test
+    fun testExtractManageProofsDataFlexibleFormatsAndServerDataFallback() {
+        val html = """
+            <html>
+            <script>
+            var t0={"WLXAccount":{"manageProofs":{"encryptedNetId":"net\u002fid\u002b1\u003d","emailProofs":[{"name":"a@b.com"}],"smsProofs":[],"passKeys":[]}}},"created":new Date()};
+            var ServerData = {"apiCanary": "server\u002bcanary\/ok\u003d"};
+            </script>
+            </html>
+        """.trimIndent()
+
+        val data = RecoveryParsers.extractManageProofsData(html, MicrosoftHttpClientFactory.json)
+        assertNotNull(data)
+        assertEquals("net/id+1=", data.encryptedNetId)
+        assertEquals("server+canary/ok=", data.apiCanary)
+        assertEquals(1, data.emailProofs.size)
+        assertEquals("a@b.com", data.emailProofs[0].name)
+    }
+
+    @Test
+    fun testExtractManageProofsDataWithRegexEscapedAndSpacedValues() {
+        val html = """
+            <html>
+            <script>
+            var t0 = { badJs: foo(), "encryptedNetId" : "enc\u002bval\u003d", "apiCanary" : "can\u002bval\/2\u003d", "emailProofs": [{"display": "user@test.com"}] };
+            </script>
+            </html>
+        """.trimIndent()
+
+        val data = RecoveryParsers.extractManageProofsData(html, MicrosoftHttpClientFactory.json)
+        assertNotNull(data)
+        assertEquals("enc+val=", data.encryptedNetId)
+        assertEquals("can+val/2=", data.apiCanary)
+        assertEquals(1, data.emailProofs.size)
+        assertEquals("user@test.com", data.emailProofs[0].name)
+    }
+
+    @Test
+    fun testSanitizePassword() {
+        assertEquals("SafePass123!@#", RecoveryParsers.sanitizePassword("""Safe"Pass\ 123'!@#"""))
+        val generated = RecoveryParsers.generateRandomPassword(14)
+        assertEquals(generated, RecoveryParsers.sanitizePassword(generated))
+    }
 }

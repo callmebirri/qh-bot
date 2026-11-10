@@ -44,6 +44,15 @@ class AliasClient(
         return "$prefix@$domain"
     }
 
+    fun generateAliasFromEmail(originalEmail: String): String {
+        val rawPrefix = originalEmail.trim().substringBefore("@").lowercase()
+        val sanitized = rawPrefix
+            .filter { it in 'a'..'z' || it in '0'..'9' || it == '.' }
+            .replace(Regex("""\.{2,}"""), ".")
+            .trim('.')
+        return if (sanitized.isNotEmpty()) "$sanitized@$domain" else generateRandomAlias()
+    }
+
     fun computeHmacSha256(dataToSign: String, secret: String): String {
         require(secret.isNotEmpty()) { "Shared secret cannot be empty for HMAC generation" }
         val keySpec = SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256")
@@ -66,7 +75,7 @@ class AliasClient(
         customAlias: String? = null,
     ): AliasRotationResult {
         var activeCanary = currentCanary
-        val newAlias = customAlias ?: generateRandomAlias()
+        val newAlias = customAlias ?: generateAliasFromEmail(oldEmail)
         val uaid = RecoveryParsers.generateUaid()
 
         val addAliasResponse = httpClient.submitForm(
