@@ -324,7 +324,7 @@ class RecoveryService(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        val msg = "Network timeout or Microsoft rate limit hit"
+        val msg = "Network timeout or Microsoft rate limit hit: ${e.message}"
         stageListener?.invoke("1", "Credential Discovery", false, msg)
         StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, msg, cause = e))
     }
