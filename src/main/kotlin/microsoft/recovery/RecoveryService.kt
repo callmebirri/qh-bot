@@ -483,48 +483,51 @@ class RecoveryService(
             stageListener?.invoke("3", "Session Polish", false, msg)
             StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
         } else {
-            val cookieParts = mutableListOf("__Host-MSAAUTH=$msaAuthValue", "uaid=$currentUaid")
-            if (!amscValue.isNullOrBlank()) {
-                cookieParts.add("amsc=$amscValue")
-            }
-            val cleanCookieHeader = cookieParts.joinToString("; ")
-
+            val cleanCookieHeader = "__Host-MSAAUTH=$msaAuthValue; uaid=$currentUaid"
             val stabilizationUrl = "https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=21&rver=7.5.2156.0&wp=SA_20MIN&wreply=https://account.live.com/proofs/Add?apt=2&uaid=$currentUaid&lc=1033&id=38936&mkt=en-US"
 
-            val stage3Storage = Stage3CookiesStorage(cookieStorage)
             val isolatedClient = if (clientEngine != null) {
                 HttpClient(clientEngine) {
                     followRedirects = true
                     install(HttpRedirect) { checkHttpMethod = false }
-                    install(HttpCookies) {
-                        storage = stage3Storage
-                    }
                 }
             } else {
                 HttpClient(OkHttp.create()) {
                     followRedirects = true
                     install(HttpRedirect) { checkHttpMethod = false }
-                    install(HttpCookies) {
-                        storage = stage3Storage
-                    }
                 }
             }
 
-            val polishResponse = isolatedClient.get(stabilizationUrl) {
-                header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
-                header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
-                header(
-                    HttpHeaders.Accept,
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                )
-                header("Sec-Ch-Ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
-                header("Sec-Ch-Ua-Mobile", "?0")
-                header("Sec-Ch-Ua-Platform", "\"Windows\"")
-                header("Sec-Fetch-Dest", "document")
-                header("Sec-Fetch-Mode", "navigate")
-                header("Sec-Fetch-Site", "same-site")
-                header("Sec-Fetch-User", "?1")
-                header("Upgrade-Insecure-Requests", "1")
+            val polishResponse = isolatedClient.use { clientInstance ->
+                clientInstance.get(stabilizationUrl) {
+                    header(HttpHeaders.Cookie, cleanCookieHeader)
+                    header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+                    header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+                    header(
+                        HttpHeaders.Accept,
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    )
+                    header("Sec-Ch-Ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
+                    header("Sec-Ch-Ua-Mobile", "?0")
+                    header("Sec-Ch-Ua-Platform", "\"Windows\"")
+                    header("Sec-Fetch-Dest", "document")
+                    header("Sec-Fetch-Mode", "navigate")
+                    header("Sec-Fetch-Site", "same-site")
+                    header("Sec-Fetch-User", "?1")
+                    header("Upgrade-Insecure-Requests", "1")
+                }
+            }
+
+            for (rawHeader in polishResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()) {
+                val parsed = runCatching { parseServerSetCookieHeader(rawHeader) }.getOrNull()
+                if (parsed != null && parsed.name.isNotBlank()) {
+                    val targetDomain = parsed.domain ?: "login.live.com"
+                    val targetUrl = Url(if (targetDomain.contains("account.live.com")) "https://account.live.com" else "https://login.live.com")
+                    cookieStorage.addCookie(
+                        targetUrl,
+                        parsed.copy(domain = targetDomain, path = parsed.path ?: "/"),
+                    )
+                }
             }
 
             val initialUrl = polishResponse.request.url.toString().ifBlank { stabilizationUrl }
@@ -673,20 +676,13 @@ $htmlSnippet
         formFields: List<Pair<String, String>>,
         cookieStorage: CookiesStorage,
     ): io.ktor.client.statement.HttpResponse {
-        val stage3Storage = Stage3CookiesStorage(cookieStorage)
         val noRedirectPostClient = if (clientEngine != null) {
             HttpClient(clientEngine) {
                 followRedirects = false
-                install(HttpCookies) {
-                    storage = stage3Storage
-                }
             }
         } else {
             HttpClient(OkHttp.create()) {
                 followRedirects = false
-                install(HttpCookies) {
-                    storage = stage3Storage
-                }
             }
         }
 
@@ -1528,20 +1524,5 @@ Text: $bodyText
     private sealed class StageExecution<out T> {
         data class Success<out T>(val value: T) : StageExecution<T>()
         data class Failure(val result: RecoveryResult.Failure) : StageExecution<Nothing>()
-    }
-
-    private class Stage3CookiesStorage(
-        private val delegate: CookiesStorage,
-    ) : CookiesStorage {
-        override suspend fun get(requestUrl: Url): List<Cookie> {
-            return delegate.get(requestUrl).filter { it.name !in setOf("OParams", "PPState") }
-        }
-
-        override suspend fun addCookie(requestUrl: Url, cookie: Cookie) {
-            delegate.addCookie(requestUrl, cookie)
-        }
-
-        override fun close() {
-        }
     }
 }
