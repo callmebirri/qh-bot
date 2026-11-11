@@ -1,5 +1,7 @@
 package microsoft.recovery.model
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -128,6 +130,8 @@ data class MakePrimaryRequest(
 
 @Serializable
 data class SecurityCleanupRequest(
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
     val passKeyId: String? = null,
     val uiflvr: Int = 1001,
     val uaid: String,
