@@ -3,6 +3,7 @@ package microsoft.recovery.stages
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.cookies.CookiesStorage
+import io.ktor.client.plugins.cookies.HttpCookies
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -89,68 +90,30 @@ class Stage8Alias(
 
             val noRedirectClient = HttpClient(client.engine) {
                 followRedirects = false
+                install(HttpCookies) {
+                    this.storage = cookieStorage
+                }
             }
 
             val addAliasResult = runCatching {
                 noRedirectClient.use { stageClient ->
-                    val (refreshCookieHeader, _) = buildIsolatedAccountCookieHeader(cookieStorage, "GET /proofs/manage/additional")
-                    val manageResponse = stageClient.get("https://account.live.com/proofs/manage/additional") {
-                        header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
-                        header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
-                        if (refreshCookieHeader.isNotBlank()) {
-                            header(HttpHeaders.Cookie, refreshCookieHeader)
-                        }
-                    }
-                    for (rawHeader in manageResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()) {
-                        val parsed = runCatching { parseServerSetCookieHeader(rawHeader) }.getOrNull()
-                        if (parsed != null && parsed.name.isNotBlank()) {
-                            cookieStorage.addCookie(
-                                Url("https://account.live.com"),
-                                parsed.copy(domain = parsed.domain ?: "account.live.com", path = parsed.path ?: "/"),
-                            )
-                        }
-                    }
-                    val manageLocation = manageResponse.headers[HttpHeaders.Location]
-                    if ((manageResponse.status == HttpStatusCode.Found ||
-                            manageResponse.status == HttpStatusCode.SeeOther ||
-                            manageResponse.status == HttpStatusCode.TemporaryRedirect) &&
-                        manageLocation != null &&
-                        (manageLocation.contains("login.microsoftonline.com", ignoreCase = true) ||
-                            manageLocation.contains("login.live.com", ignoreCase = true))
-                    ) {
-                        logger.error(
-                            "Stage 8 GET /proofs/manage/additional {} redirect Location before SessionExpiredException: {}",
-                            manageResponse.status.value,
-                            manageLocation,
-                        )
-                        throw SessionExpiredException(
-                            "Session expired during Alias Rotation. Cannot add alias.",
-                            redirectLocation = manageLocation,
+                    val loginCookies = cookieStorage.get(Url("https://login.live.com"))
+                    for (c in loginCookies) {
+                        cookieStorage.addCookie(
+                            Url("https://account.live.com"),
+                            c.copy(domain = "account.live.com", path = "/"),
                         )
                     }
-                    val manageHtml = runCatching { manageResponse.bodyAsText() }.getOrDefault("")
-                    val freshCanary = RecoveryParsers.extractApiCanary(manageHtml, MicrosoftHttpClientFactory.json)
-                    if (!freshCanary.isNullOrBlank()) {
-                        activeCanary = freshCanary
-                    }
-
-                    val actualCookieUaid = cookieStorage.get(Url("https://login.live.com"))
-                        .firstOrNull { it.name == "uaid" }
-                        ?.value
-                        ?.takeIf { it.isNotBlank() }
 
                     val (addCookieHeader, maskedCookies) = buildIsolatedAccountCookieHeader(cookieStorage, "POST /AddAssocId")
-                    val formPairs = buildList {
-                        add("canary" to activeCanary)
-                        add("PostOption" to "NONE")
-                        add("SingleDomain" to targetDomain)
-                        add("UpSell" to "")
-                        add("AddAssocIdOptions" to "LIVE")
-                        add("AssociatedIdLive" to newAliasPrefix)
-                        if (actualCookieUaid != null) {
-                            add("uaid" to actualCookieUaid)
-                        }
-                    }
+                    val formPairs = listOf(
+                        "canary" to activeCanary,
+                        "PostOption" to "NONE",
+                        "SingleDomain" to "outlook.com",
+                        "UpSell" to "",
+                        "AddAssocIdOptions" to "LIVE",
+                        "AssociatedIdLive" to newAliasPrefix,
+                    )
 
                     val maskedHeaders = buildString {
                         appendLine("canary=${maskSecretValue(activeCanary)}")
@@ -160,16 +123,9 @@ class Stage8Alias(
                         appendLine("Accept-Language=en-US,en;q=0.9")
                         append("Cookie=$maskedCookies")
                     }
-                    val maskedParams = buildString {
-                        append(
-                            formPairs.joinToString("\n") { (k, v) ->
-                                val display = if (k == "canary") maskSecretValue(v) else if (v.isEmpty()) "(empty)" else v
-                                "$k=$display"
-                            }
-                        )
-                        if (actualCookieUaid == null) {
-                            append("\nuaid=(omitted - no uaid cookie under login.live.com)")
-                        }
+                    val maskedParams = formPairs.joinToString("\n") { (k, v) ->
+                        val display = if (k == "canary") maskSecretValue(v) else if (v.isEmpty()) "(empty)" else v
+                        "$k=$display"
                     }
 
                     logger.info(
@@ -199,6 +155,16 @@ class Stage8Alias(
                         header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
                         if (addCookieHeader.isNotBlank()) {
                             header(HttpHeaders.Cookie, addCookieHeader)
+                        }
+                    }
+
+                    for (rawHeader in postResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()) {
+                        val parsed = runCatching { parseServerSetCookieHeader(rawHeader) }.getOrNull()
+                        if (parsed != null && parsed.name.isNotBlank()) {
+                            cookieStorage.addCookie(
+                                Url("https://account.live.com"),
+                                parsed.copy(domain = parsed.domain ?: "account.live.com", path = parsed.path ?: "/"),
+                            )
                         }
                     }
 
@@ -317,16 +283,12 @@ class Stage8Alias(
             merged[cookie.name] = cookie
         }
 
-        val requiredNames = listOf("__Host-MSAAUTH", "AMRPSSecAuth", "amsc")
-        val isolated = requiredNames.mapNotNull { name ->
-            merged[name]?.takeIf { it.value.isNotBlank() }?.let { name to it.value }
-        }
-        val missing = requiredNames.filter { name -> isolated.none { it.first == name } }
+        val isolated = merged.filter { (_, cookie) -> cookie.value.isNotBlank() }
+            .map { (name, cookie) -> name to cookie.value }
         val maskedSummary = if (isolated.isEmpty()) {
-            "(none; missing=${missing.joinToString(",")})"
+            "(none)"
         } else {
-            val attached = isolated.joinToString("; ") { (name, value) -> "$name=${maskSecretValue(value)}" }
-            if (missing.isEmpty()) attached else "$attached | missing=${missing.joinToString(",")}"
+            isolated.joinToString("; ") { (name, value) -> "$name=${maskSecretValue(value)}" }
         }
         logger.info(
             "Stage 8 cookie isolation for {}: {}, allStorageCookieNames={}",

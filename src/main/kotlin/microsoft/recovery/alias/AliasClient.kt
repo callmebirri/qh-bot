@@ -5,6 +5,7 @@ import io.ktor.client.call.body
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.cookies.AcceptAllCookiesStorage
 import io.ktor.client.plugins.cookies.CookiesStorage
+import io.ktor.client.plugins.cookies.HttpCookies
 import io.ktor.client.plugins.cookies.cookies
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.get
@@ -109,8 +110,25 @@ class AliasClient(
             ?: sessionUaid?.trim()?.takeIf { it.isNotEmpty() }
             ?: RecoveryParsers.generateUaid()
 
+        val clientLoginCookies = runCatching { httpClient.cookies("https://login.live.com") }.getOrNull().orEmpty()
+        for (c in clientLoginCookies) {
+            targetStorage.addCookie(Url("https://login.live.com"), c)
+            targetStorage.addCookie(Url("https://account.live.com"), c.copy(domain = "account.live.com", path = "/"))
+        }
+        val clientAccountCookies = runCatching { httpClient.cookies("https://account.live.com") }.getOrNull().orEmpty()
+        for (c in clientAccountCookies) {
+            targetStorage.addCookie(Url("https://account.live.com"), c.copy(domain = "account.live.com", path = "/"))
+        }
+        val storageLoginCookies = targetStorage.get(Url("https://login.live.com"))
+        for (c in storageLoginCookies) {
+            targetStorage.addCookie(Url("https://account.live.com"), c.copy(domain = "account.live.com", path = "/"))
+        }
+
         val noRedirectClient = HttpClient(httpClient.engine) {
             followRedirects = false
+            install(HttpCookies) {
+                this.storage = targetStorage
+            }
             install(HttpTimeout) {
                 requestTimeoutMillis = 30000
                 connectTimeoutMillis = 15000
@@ -119,22 +137,17 @@ class AliasClient(
         }
 
         val (freshApiCanary, addAliasResponse) = noRedirectClient.use { stageClient ->
-            val (refreshCookieHeader, _) = buildStage8CookieHeader(httpClient, targetStorage, "GET /proofs/manage/additional")
-            val refreshedCanary = fetchFreshApiCanary(stageClient, currentCanary, refreshCookieHeader, targetStorage)
+            val refreshedCanary = fetchFreshApiCanary(stageClient, currentCanary, targetStorage)
 
-            val refreshedCookieUaid = extractLoginUaidCookie(httpClient, targetStorage) ?: cookieUaid
             val (addCookieHeader, maskedCookieDetail) = buildStage8CookieHeader(httpClient, targetStorage, "POST /AddAssocId")
-            val formPairs = buildList {
-                add("canary" to refreshedCanary)
-                add("PostOption" to "NONE")
-                add("SingleDomain" to aliasDomain)
-                add("UpSell" to "")
-                add("AddAssocIdOptions" to "LIVE")
-                add("AssociatedIdLive" to aliasPrefix)
-                if (refreshedCookieUaid != null) {
-                    add("uaid" to refreshedCookieUaid)
-                }
-            }
+            val formPairs = listOf(
+                "canary" to refreshedCanary,
+                "PostOption" to "NONE",
+                "SingleDomain" to "outlook.com",
+                "UpSell" to "",
+                "AddAssocIdOptions" to "LIVE",
+                "AssociatedIdLive" to aliasPrefix,
+            )
 
             val maskedHeaders = buildString {
                 appendLine("canary=${maskValue(refreshedCanary)}")
@@ -146,16 +159,9 @@ class AliasClient(
                 append("Cookie=$maskedCookieDetail")
             }
 
-            val maskedParams = buildString {
-                append(
-                    formPairs.joinToString("\n") { (k, v) ->
-                        val display = if (k == "canary") maskValue(v) else if (v.isEmpty()) "(empty)" else v
-                        "$k=$display"
-                    }
-                )
-                if (refreshedCookieUaid == null) {
-                    append("\nuaid=(omitted - no uaid cookie under login.live.com)")
-                }
+            val maskedParams = formPairs.joinToString("\n") { (k, v) ->
+                val display = if (k == "canary") maskValue(v) else if (v.isEmpty()) "(empty)" else v
+                "$k=$display"
             }
 
             val debugSummary = buildString {
@@ -331,35 +337,25 @@ class AliasClient(
             merged[cookie.name] = cookie
         }
 
-        val requiredNames = listOf("__Host-MSAAUTH", "AMRPSSecAuth", "amsc")
-        val isolated = requiredNames.mapNotNull { name ->
-            merged[name]?.takeIf { it.value.isNotBlank() }?.let { name to it.value }
-        }
-        val missing = requiredNames.filter { name -> isolated.none { it.first == name } }
+        val isolated = merged.filter { (_, cookie) -> cookie.value.isNotBlank() }
+            .map { (name, cookie) -> name to cookie.value }
 
         val maskedCookieSummary = if (isolated.isEmpty()) {
-            "(none; missing=${missing.joinToString(",")})"
+            "(none)"
         } else {
-            val attached = isolated.joinToString("; ") { (name, value) -> "$name=${maskValue(value)}" }
-            if (missing.isEmpty()) attached else "$attached | missing=${missing.joinToString(",")}"
+            isolated.joinToString("; ") { (name, value) -> "$name=${maskValue(value)}" }
         }
 
-        if (missing.isNotEmpty()) {
-            logger.warn(
-                "Stage 8 cookie isolation for {}: missing={}, attached={}, allStorageCookieNames={}",
-                operationName,
-                missing.joinToString(","),
-                isolated.joinToString(",") { it.first },
-                merged.keys.joinToString(","),
-            )
-        } else {
-            logger.info(
-                "Stage 8 cookie isolation for {}: attached=ALL_3 ({}), allStorageCookieNames={}",
-                operationName,
-                maskedCookieSummary,
-                merged.keys.joinToString(","),
-            )
-        }
+        logger.info(
+            "Stage 8 cookie isolation for {}: {}, allStorageCookieNames={}, storLogin={}, storAcc={}, cliLogin={}, cliAcc={}",
+            operationName,
+            maskedCookieSummary,
+            merged.keys.joinToString(","),
+            storageLoginCookies.map { it.name },
+            storageAccountCookies.map { it.name },
+            clientLoginCookies.map { it.name },
+            clientAccountCookies.map { it.name },
+        )
 
         val rawCookieHeader = isolated.joinToString("; ") { (name, value) -> "$name=$value" }
         return rawCookieHeader to maskedCookieSummary
@@ -387,7 +383,6 @@ class AliasClient(
     private suspend fun fetchFreshApiCanary(
         client: HttpClient,
         fallbackCanary: String,
-        cookieHeader: String,
         storage: CookiesStorage,
     ): String {
         val manageResponse = client.get("https://account.live.com/proofs/manage/additional") {
@@ -397,9 +392,6 @@ class AliasClient(
                 HttpHeaders.Accept,
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             )
-            if (cookieHeader.isNotBlank()) {
-                header(HttpHeaders.Cookie, cookieHeader)
-            }
         }
         persistAccountSetCookies(manageResponse, storage)
 
