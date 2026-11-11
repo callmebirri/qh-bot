@@ -124,9 +124,14 @@ class Stage2Otp : RecoveryStageHandler {
                 stageListener?.invoke("2b", "OTP Submit", false, msg)
                 StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_ESTABLISHMENT, msg))
             } else {
+                val msaAuthValue = msaAuthCookie.value
                 context.cookieStorage.addCookie(
                     Url("https://login.live.com"),
-                    Cookie(name = "__Host-MSAAUTH", value = msaAuthCookie.value, domain = "login.live.com", path = "/", secure = true),
+                    Cookie(name = "__Host-MSAAUTH", value = msaAuthValue, domain = "login.live.com", path = "/", secure = true),
+                )
+                context.cookieStorage.addCookie(
+                    Url("https://account.live.com"),
+                    Cookie(name = "__Host-MSAAUTH", value = msaAuthValue, domain = "account.live.com", path = "/", secure = true),
                 )
 
                 val storedUaid = context.cookieStorage.get(Url("https://login.live.com")).firstOrNull { it.name == "uaid" }?.value

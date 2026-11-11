@@ -5,6 +5,7 @@ import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpRedirect
 import io.ktor.client.plugins.cookies.CookiesStorage
+import io.ktor.client.plugins.cookies.HttpCookies
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -51,17 +52,22 @@ class Stage3Polish(
                 HttpClient(clientEngine) {
                     followRedirects = true
                     install(HttpRedirect) { checkHttpMethod = false }
+                    install(HttpCookies) {
+                        this.storage = context.cookieStorage
+                    }
                 }
             } else {
                 HttpClient(OkHttp.create()) {
                     followRedirects = true
                     install(HttpRedirect) { checkHttpMethod = false }
+                    install(HttpCookies) {
+                        this.storage = context.cookieStorage
+                    }
                 }
             }
 
             val polishResponse = isolatedClient.use { clientInstance ->
                 clientInstance.get(stabilizationUrl) {
-                    header(HttpHeaders.Cookie, cleanCookieHeader)
                     header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
                     header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
                     header(
@@ -136,7 +142,7 @@ $htmlSnippet
                 )
 
                 if (actionUrl.contains("/proofs/Add", ignoreCase = true)) {
-                    val addProofResponse = submitStage3AddProofForm(actionUrl, hiddenFields)
+                    val addProofResponse = submitStage3AddProofForm(actionUrl, hiddenFields, context.cookieStorage)
                     if (captureStage3AccountCookies(addProofResponse, context.cookieStorage)) {
                         submittedAddProofViaForm = true
                         break
@@ -185,6 +191,7 @@ $htmlSnippet
                     val addProofResponse = submitStage3AddProofForm(
                         actionUrl = "https://account.live.com/proofs/Add?apt=2&wa=wsignin1.0",
                         formFields = listOf("t" to tokenT),
+                        cookieStorage = context.cookieStorage,
                     )
 
                     if (!captureStage3AccountCookies(addProofResponse, context.cookieStorage)) {
@@ -218,14 +225,21 @@ $htmlSnippet
     private suspend fun submitStage3AddProofForm(
         actionUrl: String,
         formFields: List<Pair<String, String>>,
+        cookieStorage: CookiesStorage,
     ): io.ktor.client.statement.HttpResponse {
         val noRedirectPostClient = if (clientEngine != null) {
             HttpClient(clientEngine) {
                 followRedirects = false
+                install(HttpCookies) {
+                    this.storage = cookieStorage
+                }
             }
         } else {
             HttpClient(OkHttp.create()) {
                 followRedirects = false
+                install(HttpCookies) {
+                    this.storage = cookieStorage
+                }
             }
         }
 
