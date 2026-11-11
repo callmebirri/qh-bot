@@ -1,5 +1,7 @@
 package microsoft.recovery
 
+import kotlinx.serialization.encodeToString
+import microsoft.recovery.model.SecurityCleanupRequest
 import microsoft.recovery.util.MicrosoftHttpClientFactory
 import microsoft.recovery.util.RecoveryParsers
 import kotlin.test.Test
@@ -200,5 +202,26 @@ class RecoveryParsersTest {
         assertEquals("SafePass123!@#", RecoveryParsers.sanitizePassword("""Safe"Pass\ 123'!@#"""))
         val generated = RecoveryParsers.generateRandomPassword(14)
         assertEquals(generated, RecoveryParsers.sanitizePassword(generated))
+    }
+
+    @Test
+    fun testSecurityCleanupRequestExcludesNullPassKeyId() {
+        val requestWithoutPasskey = SecurityCleanupRequest(
+            passKeyId = null,
+            uaid = "test-uaid-1234567890abcdef12345678",
+        )
+        val json = MicrosoftHttpClientFactory.json.encodeToString(requestWithoutPasskey)
+        assertTrue(!json.contains("passKeyId"), "JSON must not contain passKeyId when null: $json")
+        assertTrue(json.contains("\"uiflvr\":1001"))
+        assertTrue(json.contains("\"uaid\":\"test-uaid-1234567890abcdef12345678\""))
+        assertTrue(json.contains("\"scid\":100109"))
+        assertTrue(json.contains("\"hpgid\":201030"))
+
+        val requestWithPasskey = SecurityCleanupRequest(
+            passKeyId = "passkey-uuid-999",
+            uaid = "test-uaid-1234567890abcdef12345678",
+        )
+        val jsonWithPasskey = MicrosoftHttpClientFactory.json.encodeToString(requestWithPasskey)
+        assertTrue(jsonWithPasskey.contains("\"passKeyId\":\"passkey-uuid-999\""))
     }
 }

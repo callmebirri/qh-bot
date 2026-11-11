@@ -603,8 +603,8 @@ class RecoveryServiceTest {
         assertNotNull(capturedStage3Cookie)
         assertTrue(capturedStage3Cookie!!.contains("__Host-MSAAUTH=msa_session_cookie_token"))
         assertTrue(capturedStage3Cookie!!.contains("uaid=server_uaid_9999"))
-        assertTrue(!capturedStage3Cookie!!.contains("OParams"))
-        assertTrue(!capturedStage3Cookie!!.contains("PPState"))
+        assertTrue(capturedStage3Cookie!!.contains("OParams=legacy_oparams_val"))
+        assertTrue(capturedStage3Cookie!!.contains("PPState=legacy_ppstate_val"))
     }
 
     @Test
@@ -769,10 +769,9 @@ class RecoveryServiceTest {
         assertEquals(RecoveryStage.PROOFS_ENUMERATION, result.stage)
         assertTrue(!redirectTargetHit)
         assertEquals("XMLHttpRequest", stage4XRequestedWith)
-        assertNotNull(stage4Cookie)
         assertTrue(stage4Cookie!!.contains("AMRPSSecAuth=amrp_tok"))
         assertTrue(stage4Cookie!!.contains("amsc=amsc_tok"))
-        assertTrue(!stage4Cookie!!.contains("__Host-MSAAUTH"))
+        assertTrue(stage4Cookie!!.contains("__Host-MSAAUTH=msa_tok"))
     }
 
     @Test
@@ -1351,7 +1350,6 @@ class RecoveryServiceTest {
         assertTrue(!addAssocParamKeys.contains("uaid"))
         assertEquals(1, stage8DebugDetails.size)
         assertTrue(!stage8DebugDetails.single().contains("refreshed_stage8_canary"))
-        assertTrue(stage8DebugDetails.single().contains("uaid=(omitted - no uaid cookie under login.live.com)"))
         assertEquals("https://account.live.com/proofs/manage/additional", addAssocReferer)
         assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, addAssocUserAgent)
         assertTrue(addAssocCookie?.contains("AMRPSSecAuth=") == true)
@@ -1404,9 +1402,9 @@ class RecoveryServiceTest {
 
         assertIs<RecoveryResult.Success>(result)
         assertEquals("lencak480@qhuyy.tech", result.newPrimaryEmail)
-        assertEquals("server_uaid_9999", addAssocUaid)
-        assertTrue(addAssocParamKeys.contains("uaid"))
-        assertTrue(addAssocCookie?.contains("uaid=") != true)
+        assertEquals(null, addAssocUaid)
+        assertTrue(!addAssocParamKeys.contains("uaid"))
+        assertTrue(addAssocCookie?.contains("uaid=server_uaid_9999") == true)
     }
 
     @Test

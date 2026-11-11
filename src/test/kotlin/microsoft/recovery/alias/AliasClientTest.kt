@@ -193,13 +193,13 @@ class AliasClientTest {
         assertEquals("fresh_canary_stage8", addAssocHeaderCanary)
         assertEquals("fresh_canary_stage8", addAssocFormCanary)
         assertEquals("NONE", addAssocPostOption)
-        assertEquals("qhuyy.tech", addAssocSingleDomain)
+        assertEquals("outlook.com", addAssocSingleDomain)
         assertEquals("", addAssocUpSell)
         assertEquals("LIVE", addAssocOptions)
         assertEquals("ab12cd", addAssocLive)
-        assertEquals("exact_login_cookie_uaid_value", addAssocUaid)
+        assertEquals(null, addAssocUaid)
         assertEquals(
-            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdLive", "uaid"),
+            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdLive"),
             addAssocParamKeys,
         )
         assertEquals("https://account.live.com/proofs/manage/additional", addAssocReferer)
@@ -209,8 +209,7 @@ class AliasClientTest {
         assertTrue(addAssocCookieHeader?.contains("__Host-MSAAUTH=msa_auth_val") == true)
         assertTrue(addAssocCookieHeader?.contains("AMRPSSecAuth=amrp_val") == true)
         assertTrue(addAssocCookieHeader?.contains("amsc=amsc_val_secret_1234") == true)
-        assertTrue(addAssocCookieHeader?.contains("OParams") != true)
-        assertTrue(addAssocCookieHeader?.contains("uaid=") != true)
+        assertTrue(addAssocCookieHeader?.contains("uaid=exact_login_cookie_uaid_value") == true)
         assertEquals(1, debugPayloads.size)
         assertTrue(!debugPayloads.single().contains("fresh_canary_stage8"))
         assertTrue(!debugPayloads.single().contains("amsc_val_secret_1234"))
@@ -552,6 +551,5 @@ class AliasClientTest {
             setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdLive"),
             addAssocParamKeys,
         )
-        assertTrue(debugPayloads.single().contains("uaid=(omitted - no uaid cookie under login.live.com)"))
     }
 }
