@@ -49,6 +49,9 @@ bin/
 logs/
 data/
 .ag_buf.txt
+core.txt
+prompt.txt
+.agents/
 
 # OS
 .DS_Store
