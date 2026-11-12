@@ -6,6 +6,7 @@ import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
+import io.ktor.http.isSuccess
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -16,11 +17,14 @@ import microsoft.recovery.model.RecoveryResult
 import microsoft.recovery.model.RecoveryStage
 import microsoft.recovery.model.SecurityCleanupRequest
 import microsoft.recovery.model.StageExecution
+import org.slf4j.LoggerFactory
 import kotlin.time.Duration.Companion.milliseconds
 
 class Stage9Cleanup(
     private val stageDelayMs: Long = 1000L,
 ) : RecoveryStageHandler {
+
+    private val logger = LoggerFactory.getLogger(Stage9Cleanup::class.java)
 
     override suspend fun execute(
         context: RecoveryContext,
@@ -37,6 +41,9 @@ class Stage9Cleanup(
             header("X-Requested-With", "XMLHttpRequest")
             setBody(SecurityCleanupRequest(uaid = uaid))
         }
+        if (!disableTfaResponse.status.isSuccess()) {
+            logger.warn("DisableTfa failed with HTTP status {}", disableTfaResponse.status.value)
+        }
         val disableTfaData = runCatching { disableTfaResponse.body<GenericCanaryResponse>() }.getOrNull()
         if (!disableTfaData?.apiCanary.isNullOrBlank()) {
             activeCanary = disableTfaData.apiCanary
@@ -49,6 +56,9 @@ class Stage9Cleanup(
             header("canary", activeCanary)
             header("X-Requested-With", "XMLHttpRequest")
             setBody(SecurityCleanupRequest(uaid = uaid))
+        }
+        if (!deleteDevicesResponse.status.isSuccess()) {
+            logger.warn("DeleteDevices failed with HTTP status {}", deleteDevicesResponse.status.value)
         }
         val deleteDevicesData = runCatching { deleteDevicesResponse.body<GenericCanaryResponse>() }.onFailure {
             if (it is CancellationException) {
@@ -67,6 +77,9 @@ class Stage9Cleanup(
             header("X-Requested-With", "XMLHttpRequest")
             setBody(SecurityCleanupRequest(uaid = uaid))
         }
+        if (!deleteAppPasswordResponse.status.isSuccess()) {
+            logger.warn("DeleteAppPassword failed with HTTP status {}", deleteAppPasswordResponse.status.value)
+        }
         val deleteAppPasswordData = runCatching { deleteAppPasswordResponse.body<GenericCanaryResponse>() }.getOrNull()
         if (!deleteAppPasswordData?.apiCanary.isNullOrBlank()) {
             activeCanary = deleteAppPasswordData.apiCanary
@@ -82,22 +95,14 @@ class Stage9Cleanup(
                     header("X-Requested-With", "XMLHttpRequest")
                     setBody(SecurityCleanupRequest(passKeyId = keyId, uaid = uaid))
                 }
+                if (!removePasskeyResponse.status.isSuccess()) {
+                    logger.warn("RemovePasskey failed for passkey {}: HTTP status {}", keyId, removePasskeyResponse.status.value)
+                }
                 val removePasskeyData = runCatching { removePasskeyResponse.body<GenericCanaryResponse>() }.getOrNull()
                 if (!removePasskeyData?.apiCanary.isNullOrBlank()) {
                     activeCanary = removePasskeyData.apiCanary
                 }
                 if (stageDelayMs > 0) delay(stageDelayMs)
-            }
-        } else {
-            val removePasskeyResponse = client.post("https://account.live.com/API/Proofs/RemovePasskey") {
-                contentType(ContentType.Application.Json)
-                header("canary", activeCanary)
-                header("X-Requested-With", "XMLHttpRequest")
-                setBody(SecurityCleanupRequest(uaid = uaid))
-            }
-            val removePasskeyData = runCatching { removePasskeyResponse.body<GenericCanaryResponse>() }.getOrNull()
-            if (!removePasskeyData?.apiCanary.isNullOrBlank()) {
-                activeCanary = removePasskeyData.apiCanary
             }
         }
 

@@ -252,8 +252,8 @@ class Stage8Alias(
             )
             val removeAliasHtml = runCatching { removeAliasResponse.bodyAsText() }.getOrDefault("")
             val confirmed = removeAliasHtml.contains("Note_AssociatedIdRemoved")
-            if (!confirmed && !removeAliasResponse.status.isSuccess()) {
-                val msg = "RemoveAlias failed: HTTP ${removeAliasResponse.status.value}"
+            if (!confirmed) {
+                val msg = "RemoveAlias failed: confirmation string 'Note_AssociatedIdRemoved' not found in response (HTTP ${removeAliasResponse.status.value})"
                 stageListener?.invoke("8", "Alias Rotation", false, msg)
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, msg))
             }

@@ -595,7 +595,7 @@ class AliasClient(
         val html = response.bodyAsText()
         val confirmed = html.contains("Note_AssociatedIdRemoved")
         logger.info("Stage 8 RemoveAlias response: oldEmail={}, status={}, confirmed={}", oldEmail, response.status.value, confirmed)
-        if (!confirmed && !response.status.isSuccess()) {
+        if (!confirmed) {
             throw AliasVerificationFailedException("RemoveAlias response did not contain confirmation")
         }
     }

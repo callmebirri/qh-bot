@@ -72,10 +72,23 @@ class Stage7Suppression(
                 return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.NOTIFICATION_SUPPRESSION, msg))
             }
 
-            val canaryResponse = runCatching { suppressionResponse.body<GenericCanaryResponse>() }.getOrNull()
-            if (!canaryResponse?.apiCanary.isNullOrBlank()) {
-                activeCanary = canaryResponse.apiCanary
+            val finalPath = suppressionResponse.call.request.url.encodedPath
+            if (finalPath != "/API/Proofs/SetUserNotificationState") {
+                val msg = "Notification suppression failed for proof ${proof.name}: redirected to unexpected path $finalPath"
+                stageListener?.invoke("7", "Notification Suppression", false, msg)
+                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.NOTIFICATION_SUPPRESSION, msg))
             }
+
+            val canaryResponse = runCatching { suppressionResponse.body<GenericCanaryResponse>() }.getOrNull()
+            val newCanary = canaryResponse?.apiCanary
+            if (newCanary.isNullOrBlank()) {
+                val errorDetail = canaryResponse?.error?.message ?: canaryResponse?.error?.code ?: "missing apiCanary in response"
+                val msg = "Notification suppression failed for proof ${proof.name}: $errorDetail"
+                stageListener?.invoke("7", "Notification Suppression", false, msg)
+                return StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.NOTIFICATION_SUPPRESSION, msg))
+            }
+
+            activeCanary = newCanary
             suppressedCount++
 
             if (stageDelayMs > 0) delay(stageDelayMs)

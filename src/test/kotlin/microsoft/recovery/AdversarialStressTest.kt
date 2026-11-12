@@ -19,10 +19,14 @@ import kotlinx.coroutines.runBlocking
 import microsoft.recovery.alias.AliasClient
 import microsoft.recovery.alias.SessionExpiredException
 import microsoft.recovery.context.RecoveryContext
+import microsoft.recovery.model.ProofItem
 import microsoft.recovery.model.RecoveryResult
+import microsoft.recovery.model.RecoveryStage
 import microsoft.recovery.model.StageExecution
 import microsoft.recovery.stages.Stage2Otp
+import microsoft.recovery.stages.Stage7Suppression
 import microsoft.recovery.stages.Stage8Alias
+import microsoft.recovery.stages.Stage9Cleanup
 import microsoft.recovery.util.MicrosoftHttpClientFactory
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -441,5 +445,249 @@ class AdversarialStressTest {
         assertEquals("login.live.com", parsedDomain.domain)
         assertEquals("/", parsedDomain.path)
         assertTrue(parsedDomain.secure)
+    }
+
+    @Test
+    fun testStage8RemoveAliasFailsClosedWhenConfirmationMissing(): Unit = runBlocking {
+        val storage = AcceptAllCookiesStorage()
+        val mockEngine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/AddAssocId" -> respond(
+                    content = "",
+                    status = HttpStatusCode.Found,
+                    headers = headersOf(HttpHeaders.Location, "https://account.live.com/proofs/manage/additional"),
+                )
+                "/API/MakePrimary" -> respond(
+                    content = """{"apiCanary":"primary_canary"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+                "/names/manage" -> respond(
+                    content = "<html>Error: Could not remove alias</html>",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                )
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = MicrosoftHttpClientFactory.create(storage = storage, engine = mockEngine)
+        val context = RecoveryContext(
+            email = "victim@domain.com",
+            newPassword = "NewPassword123!",
+            newEmail = "newalias",
+            uaid = "uaid_val_123",
+            activeCanary = "initial_canary",
+            httpClient = client,
+            cookieStorage = storage,
+        )
+
+        val stage8 = Stage8Alias(aliasClient = null, stageDelayMs = 0L)
+        val result = stage8.execute(context, null)
+
+        assertIs<StageExecution.Failure>(result)
+        assertEquals(RecoveryStage.ALIAS_ROTATION, result.result.stage)
+        assertTrue(result.result.message.contains("Note_AssociatedIdRemoved"))
+    }
+
+    @Test
+    fun testStage9CleanupOmitsRemovePasskeyWhenEmpty(): Unit = runBlocking {
+        val storage = AcceptAllCookiesStorage()
+        val requestedPaths = mutableListOf<String>()
+        val mockEngine = MockEngine { request ->
+            requestedPaths.add(request.url.encodedPath)
+            when (request.url.encodedPath) {
+                "/API/Proofs/DisableTfa",
+                "/API/Proofs/DeleteDevices",
+                "/API/Proofs/DeleteAppPassword",
+                "/API/Proofs/RemovePasskey" -> respond(
+                    content = """{"apiCanary":"cleanup_canary"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = MicrosoftHttpClientFactory.create(storage = storage, engine = mockEngine)
+        val context = RecoveryContext(
+            email = "victim@domain.com",
+            newPassword = "NewPassword123!",
+            newEmail = "newalias",
+            uaid = "uaid_val_123",
+            activeCanary = "initial_canary",
+            passKeyIds = emptyList(),
+            httpClient = client,
+            cookieStorage = storage,
+        )
+
+        val stage9 = Stage9Cleanup(stageDelayMs = 0L)
+        val result = stage9.execute(context, null)
+
+        assertIs<StageExecution.Success<Unit>>(result)
+        assertTrue(requestedPaths.contains("/API/Proofs/DisableTfa"))
+        assertTrue(requestedPaths.contains("/API/Proofs/DeleteDevices"))
+        assertTrue(requestedPaths.contains("/API/Proofs/DeleteAppPassword"))
+        assertTrue(!requestedPaths.contains("/API/Proofs/RemovePasskey"))
+    }
+
+    @Test
+    fun testStage9CleanupIteratesPasskeysAndHandlesFailuresGracefully(): Unit = runBlocking {
+        val storage = AcceptAllCookiesStorage()
+        val requestedPasskeys = mutableListOf<String>()
+        val mockEngine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/API/Proofs/DisableTfa" -> respond(
+                    content = "Internal Server Error",
+                    status = HttpStatusCode.InternalServerError,
+                )
+                "/API/Proofs/DeleteDevices" -> respond(
+                    content = "Bad Request",
+                    status = HttpStatusCode.BadRequest,
+                )
+                "/API/Proofs/DeleteAppPassword" -> respond(
+                    content = "Not Found",
+                    status = HttpStatusCode.NotFound,
+                )
+                "/API/Proofs/RemovePasskey" -> {
+                    val bodyText = (request.body as? io.ktor.http.content.TextContent)?.text.orEmpty()
+                    if (bodyText.contains("key-alpha")) requestedPasskeys.add("key-alpha")
+                    if (bodyText.contains("key-beta")) requestedPasskeys.add("key-beta")
+                    respond(
+                        content = """{"apiCanary":"canary_passkey"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                    )
+                }
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = MicrosoftHttpClientFactory.create(storage = storage, engine = mockEngine)
+        val context = RecoveryContext(
+            email = "victim@domain.com",
+            newPassword = "NewPassword123!",
+            newEmail = "newalias",
+            uaid = "uaid_val_123",
+            activeCanary = "initial_canary",
+            passKeyIds = listOf("key-alpha", "key-beta"),
+            httpClient = client,
+            cookieStorage = storage,
+        )
+
+        val stage9 = Stage9Cleanup(stageDelayMs = 0L)
+        val result = stage9.execute(context, null)
+
+        assertIs<StageExecution.Success<Unit>>(result)
+        assertEquals(listOf("key-alpha", "key-beta"), requestedPasskeys)
+    }
+
+    @Test
+    fun testStage7SuppressionRedirectToLoginSrfFailsClosed(): Unit = runBlocking {
+        val storage = AcceptAllCookiesStorage()
+        val mockEngine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/proofs/manage/additional" -> respond(
+                    content = """
+                        <html>
+                        <script>
+                        var t0 = {
+                            "WLXAccount": {
+                                "manageProofs": {
+                                    "encryptedNetId": "enc_net_id_123",
+                                    "apiCanary": "canary_manage_123",
+                                    "emailProofs": [{"name": "victim@example.com"}]
+                                }
+                            }
+                        };
+                        </script>
+                        </html>
+                    """.trimIndent(),
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                )
+                "/API/Proofs/SetUserNotificationState" -> respond(
+                    content = "",
+                    status = HttpStatusCode.Found,
+                    headers = headersOf(HttpHeaders.Location, "https://login.live.com/login.srf"),
+                )
+                "/login.srf" -> respond(
+                    content = "<html>Login</html>",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                )
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = MicrosoftHttpClientFactory.create(storage = storage, engine = mockEngine)
+        val context = RecoveryContext(
+            email = "victim@domain.com",
+            newPassword = "NewPassword123!",
+            newEmail = "newalias",
+            uaid = "uaid_val_123",
+            activeCanary = "initial_canary",
+            httpClient = client,
+            cookieStorage = storage,
+        )
+
+        val stage7 = Stage7Suppression(stageDelayMs = 0L)
+        val result = stage7.execute(context, null)
+
+        assertIs<StageExecution.Failure>(result)
+        assertEquals(RecoveryStage.NOTIFICATION_SUPPRESSION, result.result.stage)
+        assertTrue(result.result.message.contains("redirected to unexpected path /login.srf"))
+    }
+
+    @Test
+    fun testStage7SuppressionMissingCanaryFailsClosed(): Unit = runBlocking {
+        val storage = AcceptAllCookiesStorage()
+        val mockEngine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/proofs/manage/additional" -> respond(
+                    content = """
+                        <html>
+                        <script>
+                        var t0 = {
+                            "WLXAccount": {
+                                "manageProofs": {
+                                    "encryptedNetId": "enc_net_id_123",
+                                    "apiCanary": "canary_manage_123",
+                                    "emailProofs": [{"name": "victim@example.com"}]
+                                }
+                            }
+                        };
+                        </script>
+                        </html>
+                    """.trimIndent(),
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                )
+                "/API/Proofs/SetUserNotificationState" -> respond(
+                    content = """{"error":{"code":"InvalidSession","message":"Session expired"}}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = MicrosoftHttpClientFactory.create(storage = storage, engine = mockEngine)
+        val context = RecoveryContext(
+            email = "victim@domain.com",
+            newPassword = "NewPassword123!",
+            newEmail = "newalias",
+            uaid = "uaid_val_123",
+            activeCanary = "initial_canary",
+            httpClient = client,
+            cookieStorage = storage,
+        )
+
+        val stage7 = Stage7Suppression(stageDelayMs = 0L)
+        val result = stage7.execute(context, null)
+
+        assertIs<StageExecution.Failure>(result)
+        assertEquals(RecoveryStage.NOTIFICATION_SUPPRESSION, result.result.stage)
+        assertTrue(result.result.message.contains("Session expired"))
     }
 }
