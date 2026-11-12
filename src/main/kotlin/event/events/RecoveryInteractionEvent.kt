@@ -32,9 +32,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 import microsoft.recovery.RecoveryService
 import microsoft.recovery.alias.OtcTimeoutException
 import microsoft.recovery.model.RecoveryResult
+import microsoft.recovery.stages.StageListener
 import org.slf4j.LoggerFactory
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration.Companion.milliseconds
 
 class RecoveryInteractionEvent(
@@ -88,6 +91,40 @@ class RecoveryInteractionEvent(
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             logger.error("Failed to mark account SUCCESS for {}: {}", email, e.message, e)
+        }
+    }
+
+    internal fun createStageListener(
+        logChannelId: Long,
+        discordLogger: DiscordLogger,
+        onDebugUpdate: (String) -> Unit = {},
+        onFailureLogged: () -> Unit = {},
+    ): StageListener {
+        val failureEmitted = AtomicBoolean(false)
+        val latestDebugContext = AtomicReference<String?>(null)
+        return { stageKey, stageName, isSuccess, detail ->
+            if (isSuccess) {
+                if (stageKey == "3-debug" || stageKey == "8-debug" || stageKey.endsWith("-debug")) {
+                    latestDebugContext.set(detail)
+                    onDebugUpdate(detail)
+                    logger.debug("Stage {}: {} - {}", stageKey, stageName, detail)
+                } else {
+                    logger.info("Stage {}: {} succeeded - {}", stageKey, stageName, detail)
+                }
+            } else {
+                if (failureEmitted.compareAndSet(false, true)) {
+                    onFailureLogged()
+                    logger.error("Stage {}: {} failed - {}", stageKey, stageName, detail)
+                    discordLogger.sendDetailedFailure(
+                        logChannelId = logChannelId,
+                        stageName = stageName,
+                        errorReason = detail,
+                        debugContext = latestDebugContext.get(),
+                    )
+                } else {
+                    logger.warn("Stage {}: {} failed after failure already logged - {}", stageKey, stageName, detail)
+                }
+            }
         }
     }
 
@@ -188,6 +225,8 @@ class RecoveryInteractionEvent(
 
                     recoveryScope.launch {
                         var initialResponse: EphemeralMessageInteractionResponse? = null
+                        var failureLogged = false
+                        var capturedDebugContext: String? = null
                         try {
                             val canProceed = prepareRecoveryAccount(email)
                             if (!canProceed) {
@@ -233,15 +272,12 @@ class RecoveryInteractionEvent(
                                         pendingOtpSessions.remove(sessionId)
                                     }
                                 },
-                                stageListener = { stageKey, stageName, isSuccess, detail ->
-                                    discordLogger.logStage(
-                                        logChannelId = properties.logChannelId,
-                                        stageKey = stageKey,
-                                        stageName = stageName,
-                                        isSuccess = isSuccess,
-                                        detail = detail,
-                                    )
-                                },
+                                stageListener = createStageListener(
+                                    logChannelId = properties.logChannelId,
+                                    discordLogger = discordLogger,
+                                    onDebugUpdate = { capturedDebugContext = it },
+                                    onFailureLogged = { failureLogged = true },
+                                ),
                                 aliasOtcProvider = { alias ->
                                     val aliasSessionId = UUID.randomUUID().toString().take(8)
                                     val aliasOtcDeferred = CompletableDeferred<String>()
@@ -307,6 +343,15 @@ class RecoveryInteractionEvent(
                                 }
 
                                 is RecoveryResult.Failure -> {
+                                    if (!failureLogged) {
+                                        failureLogged = true
+                                        discordLogger.sendDetailedFailure(
+                                            logChannelId = properties.logChannelId,
+                                            stageName = result.stage.name,
+                                            errorReason = result.message,
+                                            debugContext = capturedDebugContext,
+                                        )
+                                    }
                                     discordLogger.sendFinalResult(
                                         notiChannelId = properties.notiChannelId,
                                         isSuccess = false,
@@ -336,6 +381,15 @@ class RecoveryInteractionEvent(
                             }
                         } catch (e: Exception) {
                             logger.error("Failed to run recovery lifecycle for {}: {}", email, e.message, e)
+                            if (!failureLogged) {
+                                failureLogged = true
+                                discordLogger.sendDetailedFailure(
+                                    logChannelId = properties.logChannelId,
+                                    stageName = "Lifecycle Error",
+                                    errorReason = e.message ?: "Unexpected error",
+                                    debugContext = capturedDebugContext,
+                                )
+                            }
                             discordLogger.sendFinalResult(
                                 notiChannelId = properties.notiChannelId,
                                 isSuccess = false,

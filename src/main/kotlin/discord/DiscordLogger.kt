@@ -8,28 +8,78 @@ import dev.kord.core.behavior.channel.MessageChannelBehavior
 import dev.kord.core.behavior.channel.createEmbed
 import dev.kord.core.behavior.channel.createMessage
 import dev.kord.core.entity.Message
+import dev.kord.rest.builder.message.EmbedBuilder
 import dev.kord.rest.builder.message.actionRow
 import dev.kord.rest.builder.message.embed
 import kotlinx.coroutines.CancellationException
 import org.slf4j.LoggerFactory
 
-class DiscordLogger(
-    private val kord: Kord,
+open class DiscordLogger(
+    protected val kord: Kord? = null,
 ) {
     private val logger = LoggerFactory.getLogger(DiscordLogger::class.java)
 
     private val greenColor = Color(87, 242, 135)
     private val redColor = Color(237, 66, 69)
     private val yellowColor = Color(254, 231, 92)
+    private val failureColor = Color(0xFF3B30)
 
-    suspend fun logStage(
+    open suspend fun sendDetailedFailure(
+        logChannelId: Long,
+        stageName: String,
+        errorReason: String,
+        debugContext: String? = null,
+    ): Unit {
+        if (logChannelId == 0L || kord == null) return
+        try {
+            val channel = MessageChannelBehavior(Snowflake(logChannelId.toULong()), kord)
+            channel.createEmbed {
+                title = "Account Recovery Failed"
+                color = failureColor
+                description = "Chi tiết lỗi trong quá trình khôi phục tài khoản:"
+                field("Stage", true) { stageName.ifBlank { "Unknown Stage" }.take(1024) }
+                field("Failure Reason", false) { errorReason.ifBlank { "Unknown Error" }.take(1024) }
+                if (!debugContext.isNullOrBlank()) {
+                    val chunks = debugContext.take(3072).chunked(1024)
+                    chunks.forEachIndexed { index, chunk ->
+                        val fieldName = if (index == 0) "Debug Context" else "Debug Context (${index + 1})"
+                        field(fieldName, false) { chunk }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            logger.error("Failed to send detailed failure embed to channel {}: {}", logChannelId, e.message)
+        }
+    }
+
+    internal fun buildFailureEmbed(
+        stageName: String,
+        errorReason: String,
+        debugContext: String? = null,
+    ): EmbedBuilder = EmbedBuilder().apply {
+        title = "Account Recovery Failed"
+        color = failureColor
+        description = "Chi tiết lỗi trong quá trình khôi phục tài khoản:"
+        field("Stage", true) { stageName.ifBlank { "Unknown Stage" }.take(1024) }
+        field("Failure Reason", false) { errorReason.ifBlank { "Unknown Error" }.take(1024) }
+        if (!debugContext.isNullOrBlank()) {
+            val chunks = debugContext.take(3072).chunked(1024)
+            chunks.forEachIndexed { index, chunk ->
+                val fieldName = if (index == 0) "Debug Context" else "Debug Context (${index + 1})"
+                field(fieldName, false) { chunk }
+            }
+        }
+    }
+
+    open suspend fun logStage(
         logChannelId: Long,
         stageKey: String,
         stageName: String,
         isSuccess: Boolean,
         detail: String,
-    ) {
-        if (logChannelId == 0L) return
+    ): Unit {
+        if (logChannelId == 0L || kord == null) return
         try {
             val channel = MessageChannelBehavior(Snowflake(logChannelId.toULong()), kord)
             val statusText = if (isSuccess) "Success" else "Failure"
@@ -45,7 +95,7 @@ class DiscordLogger(
         }
     }
 
-    suspend fun sendFinalResult(
+    open suspend fun sendFinalResult(
         notiChannelId: Long,
         isSuccess: Boolean,
         ign: String,
@@ -54,8 +104,8 @@ class DiscordLogger(
         password: String? = null,
         recoveryCode: String? = null,
         errorReason: String? = null,
-    ) {
-        if (notiChannelId == 0L) return
+    ): Unit {
+        if (notiChannelId == 0L || kord == null) return
         try {
             val channel = MessageChannelBehavior(Snowflake(notiChannelId.toULong()), kord)
 
@@ -93,12 +143,12 @@ Recovery: ${recoveryCode ?: "N/A"}
         }
     }
 
-    suspend fun sendAliasOtcPrompt(
+    open suspend fun sendAliasOtcPrompt(
         channelId: Long,
         alias: String,
         sessionId: String,
     ): Message? {
-        if (channelId == 0L) return null
+        if (channelId == 0L || kord == null) return null
         return try {
             val channel = MessageChannelBehavior(Snowflake(channelId.toULong()), kord)
             channel.createMessage {
@@ -120,8 +170,8 @@ Recovery: ${recoveryCode ?: "N/A"}
         }
     }
 
-    suspend fun sendInitialEmbed(notiChannelId: Long) {
-        if (notiChannelId == 0L) return
+    open suspend fun sendInitialEmbed(notiChannelId: Long): Unit {
+        if (notiChannelId == 0L || kord == null) return
         try {
             val channel = MessageChannelBehavior(Snowflake(notiChannelId.toULong()), kord)
             channel.createMessage {
