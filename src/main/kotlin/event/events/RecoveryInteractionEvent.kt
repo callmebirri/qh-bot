@@ -50,6 +50,7 @@ class RecoveryInteractionEvent(
     private val recoveryScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val pendingOtpSessions = ConcurrentHashMap<String, CompletableDeferred<String>>()
     private val pendingAliasOtcSessions = ConcurrentHashMap<String, CompletableDeferred<String>>()
+    private val pendingReloginOtpSessions = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
     internal fun getPendingAliasOtcSession(sessionId: String): CompletableDeferred<String>? = pendingAliasOtcSessions[sessionId]
     internal fun setPendingAliasOtcSession(sessionId: String, deferred: CompletableDeferred<String>) {
@@ -59,11 +60,19 @@ class RecoveryInteractionEvent(
         pendingAliasOtcSessions.remove(sessionId)
     }
 
+    internal fun getPendingReloginOtpSession(sessionId: String): CompletableDeferred<String>? = pendingReloginOtpSessions[sessionId]
+    internal fun setPendingReloginOtpSession(sessionId: String, deferred: CompletableDeferred<String>) {
+        pendingReloginOtpSessions[sessionId] = deferred
+    }
+    internal fun removePendingReloginOtpSession(sessionId: String) {
+        pendingReloginOtpSessions.remove(sessionId)
+    }
+
     internal suspend fun prepareRecoveryAccount(email: String): Boolean = withContext(Dispatchers.IO) {
         if (email.isBlank()) return@withContext true
         try {
             val existing = accountRepository.getAccountByOriginalEmail(email)
-            if (existing != null && existing.status.equals(RecoveredAccount.STATUS_SUCCESS, ignoreCase = true)) {
+            if (existing != null && (existing.status.equals(RecoveredAccount.STATUS_SUCCESS, ignoreCase = true) || existing.status.equals(RecoveredAccount.STATUS_SUCCESS_PARTIAL, ignoreCase = true) || existing.status.equals(RecoveredAccount.STATUS_PARTIAL_SUCCESS, ignoreCase = true))) {
                 return@withContext false
             }
             if (existing != null) {
@@ -92,13 +101,13 @@ class RecoveryInteractionEvent(
                     password = result.password,
                     recoveryCode = result.finalRecoveryCode,
                     ownsMinecraft = false,
-                    status = RecoveredAccount.STATUS_SUCCESS,
-                    failReason = null,
+                    status = if (result.isPartial) RecoveredAccount.STATUS_SUCCESS_PARTIAL else RecoveredAccount.STATUS_SUCCESS,
+                    failReason = if (result.isPartial) result.message else null,
                 ),
             )
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            logger.error("Failed to mark account SUCCESS for {}: {}", email, e.message, e)
+            logger.error("Failed to mark account status for {}: {}", email, e.message, e)
         }
     }
 
@@ -218,6 +227,40 @@ class RecoveryInteractionEvent(
                         }
                     }
                 }
+
+                componentId.startsWith("open_relogin_otp_modal:") -> {
+                    val sessionId = componentId.substringAfter("open_relogin_otp_modal:")
+                    if (!pendingReloginOtpSessions.containsKey(sessionId)) {
+                        runCatching {
+                            interaction.respondEphemeral {
+                                content = "Phiên nhập OTP mới này đã hết hạn hoặc đã được xử lý."
+                            }
+                        }.onFailure {
+                            if (it is CancellationException) {
+                                currentCoroutineContext().ensureActive()
+                            }
+                        }.onFailure { err ->
+                            logger.warn("Could not respond to expired relogin OTP button: {}", err.message)
+                        }
+                    } else {
+                        runCatching {
+                            interaction.modal("Nhập mã OTP phiên mới", "recovery_relogin_otp_modal:$sessionId") {
+                                actionRow {
+                                    textInput(TextInputStyle.Short, "relogin_otp_input", "Mã OTP mới") {
+                                        required = true
+                                        placeholder = "Nhập mã OTP gồm 6 chữ số từ email"
+                                    }
+                                }
+                            }
+                        }.onFailure {
+                            if (it is CancellationException) {
+                                currentCoroutineContext().ensureActive()
+                            }
+                        }.onFailure { err ->
+                            logger.warn("Could not open recovery_relogin_otp_modal: {}", err.message)
+                        }
+                    }
+                }
             }
         }
 
@@ -333,6 +376,41 @@ class RecoveryInteractionEvent(
                                         }
                                     }
                                 },
+                                reloginOtpProvider = {
+                                    val reloginSessionId = UUID.randomUUID().toString().take(8)
+                                    val reloginOtpDeferred = CompletableDeferred<String>()
+                                    pendingReloginOtpSessions[reloginSessionId] = reloginOtpDeferred
+                                    runCatching {
+                                        initialResponse?.edit {
+                                            content = "Phiên đổi mật khẩu thành công. Để tiếp tục đổi Alias, vui lòng nhập mã OTP mới được gửi tới email:"
+                                            actionRow {
+                                                interactionButton(ButtonStyle.Primary, "open_relogin_otp_modal:$reloginSessionId") {
+                                                    label = "Nhập OTP mới"
+                                                }
+                                            }
+                                        } ?: response.respond {
+                                            content = "Phiên đổi mật khẩu thành công. Để tiếp tục đổi Alias, vui lòng nhập mã OTP mới được gửi tới email:"
+                                            actionRow {
+                                                interactionButton(ButtonStyle.Primary, "open_relogin_otp_modal:$reloginSessionId") {
+                                                    label = "Nhập OTP mới"
+                                                }
+                                            }
+                                        }
+                                    }.onFailure {
+                                        if (it is CancellationException) {
+                                            currentCoroutineContext().ensureActive()
+                                        }
+                                    }.onFailure { err ->
+                                        logger.error("Failed to respond with relogin OTP button: {}", err.message)
+                                    }
+                                    try {
+                                        withTimeout(120_000L.milliseconds) {
+                                            reloginOtpDeferred.await()
+                                        }
+                                    } finally {
+                                        pendingReloginOtpSessions.remove(reloginSessionId)
+                                    }
+                                },
                             )
 
                             val finalMsg = when (result) {
@@ -347,7 +425,11 @@ class RecoveryInteractionEvent(
                                         password = result.password,
                                         recoveryCode = result.finalRecoveryCode,
                                     )
-                                    "✅ Khôi phục tài khoản hoàn tất thành công!"
+                                    if (result.isPartial) {
+                                        "⚠️ Đã đổi mật khẩu thành công, nhưng không thể đổi Alias do session bị vô hiệu hóa / MFA. Tài khoản giữ nguyên email gốc: `$email`"
+                                    } else {
+                                        "✅ Khôi phục tài khoản hoàn tất thành công!"
+                                    }
                                 }
 
                                 is RecoveryResult.Failure -> {
@@ -461,6 +543,25 @@ class RecoveryInteractionEvent(
                     }
 
                     pendingAliasOtcSessions[sessionId]?.complete(rawAliasOtc)
+                }
+
+                modalId.startsWith("recovery_relogin_otp_modal:") -> {
+                    val sessionId = modalId.substringAfter("recovery_relogin_otp_modal:")
+                    val otp = interaction.textInputs["relogin_otp_input"]?.value?.trim().orEmpty()
+
+                    runCatching {
+                        interaction.respondEphemeral {
+                            content = "Đã nhận mã OTP phiên mới. Đang làm mới session và tiếp tục đổi Alias..."
+                        }
+                    }.onFailure {
+                        if (it is CancellationException) {
+                            currentCoroutineContext().ensureActive()
+                        }
+                    }.onFailure { err ->
+                        logger.warn("Could not respond to relogin OTP modal interaction: {}", err.message)
+                    }
+
+                    pendingReloginOtpSessions[sessionId]?.complete(otp)
                 }
             }
         }

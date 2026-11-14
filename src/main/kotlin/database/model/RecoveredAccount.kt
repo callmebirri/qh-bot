@@ -15,6 +15,8 @@ data class RecoveredAccount(
     companion object {
         const val STATUS_PENDING: String = "PENDING"
         const val STATUS_SUCCESS: String = "SUCCESS"
+        const val STATUS_PARTIAL_SUCCESS: String = "PARTIAL_SUCCESS"
+        const val STATUS_SUCCESS_PARTIAL: String = "SUCCESS_PARTIAL"
         const val STATUS_FAILED: String = "FAILED"
     }
 }

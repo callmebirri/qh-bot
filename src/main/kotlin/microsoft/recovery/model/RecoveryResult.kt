@@ -9,6 +9,7 @@ sealed class RecoveryResult {
         val finalRecoveryCode: String,
         val suppressedProofsCount: Int,
         val message: String = "Account recovery and lifecycle completed successfully",
+        val isPartial: Boolean = false,
     ) : RecoveryResult()
 
     data class Failure(

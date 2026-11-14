@@ -1465,4 +1465,161 @@ class RecoveryServiceTest {
         assertEquals(null, addAssocUaid)
         assertTrue(!addAssocParamKeys.contains("uaid"))
     }
+
+    @Test
+    fun testReloginFallbackSucceedsWhenStage8InitiallyHitsMfa(): Unit = runBlocking {
+        var addAssocAttempts = 0
+        var reloginOtpCalled = false
+        val baseEngine = createMockEngine()
+
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/AddAssocId" -> {
+                    addAssocAttempts++
+                    if (addAssocAttempts == 1) {
+                        respond(
+                            content = "",
+                            status = HttpStatusCode.Found,
+                            headers = headersOf(
+                                HttpHeaders.Location,
+                                "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
+                            ),
+                        )
+                    } else {
+                        respond("<html>Added</html>", HttpStatusCode.OK)
+                    }
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            aliasClient = null,
+            stopAfterStage7 = false,
+        )
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newEmail = "new_alias@outlook.com",
+            reloginOtpProvider = {
+                reloginOtpCalled = true
+                "654321"
+            },
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertEquals(false, result.isPartial)
+        assertEquals(true, reloginOtpCalled)
+        assertEquals(2, addAssocAttempts)
+        assertEquals("new_alias@outlook.com", result.newPrimaryEmail)
+    }
+
+    @Test
+    fun testReloginFallbackReturnsPartialSuccessWhenReloginOtpFails(): Unit = runBlocking {
+        val tempDb = File.createTempFile("test_relogin_fail_", ".db")
+        val dbManager = DatabaseManager(tempDb.absolutePath)
+        val repository = SqliteAccountRepository(dbManager)
+
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/AddAssocId" -> {
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
+                        ),
+                    )
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            accountRepository = repository,
+            aliasClient = null,
+            stopAfterStage7 = false,
+        )
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newEmail = "new_alias@outlook.com",
+            reloginOtpProvider = {
+                error("User closed modal without entering OTP")
+            },
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertEquals(true, result.isPartial)
+        assertEquals("victim@example.com", result.newPrimaryEmail)
+        assertTrue(result.message.contains("Partial success"))
+
+        val savedAccount = repository.getAccountByOriginalEmail("victim@example.com")
+        assertNotNull(savedAccount)
+        assertEquals(RecoveredAccount.STATUS_SUCCESS_PARTIAL, savedAccount.status)
+        assertEquals("victim@example.com", savedAccount.currentPrimaryEmail)
+    }
+
+    @Test
+    fun testReloginFallbackReturnsPartialSuccessWhenStage8FailsAgainAfterRelogin(): Unit = runBlocking {
+        val tempDb = File.createTempFile("test_relogin_retry_fail_", ".db")
+        val dbManager = DatabaseManager(tempDb.absolutePath)
+        val repository = SqliteAccountRepository(dbManager)
+
+        var addAssocCount = 0
+        var reloginOtpCalled = false
+        val baseEngine = createMockEngine()
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/AddAssocId" -> {
+                    addAssocCount++
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
+                        ),
+                    )
+                }
+                else -> baseEngine.config.requestHandlers.first()(this, request)
+            }
+        }
+
+        val service = RecoveryService(
+            clientEngine = engine,
+            stageDelayMs = 0L,
+            accountRepository = repository,
+            aliasClient = null,
+            stopAfterStage7 = false,
+        )
+
+        val result = service.runLifecycle(
+            email = "victim@example.com",
+            otpProvider = { "123456" },
+            newEmail = "new_alias@outlook.com",
+            reloginOtpProvider = {
+                reloginOtpCalled = true
+                "654321"
+            },
+        )
+
+        assertIs<RecoveryResult.Success>(result)
+        assertEquals(true, result.isPartial)
+        assertEquals(true, reloginOtpCalled)
+        assertEquals(2, addAssocCount)
+        assertEquals("victim@example.com", result.newPrimaryEmail)
+
+        val savedAccount = repository.getAccountByOriginalEmail("victim@example.com")
+        assertNotNull(savedAccount)
+        assertEquals(RecoveredAccount.STATUS_SUCCESS_PARTIAL, savedAccount.status)
+    }
 }

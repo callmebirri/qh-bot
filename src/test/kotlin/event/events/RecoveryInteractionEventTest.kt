@@ -363,4 +363,54 @@ class RecoveryInteractionEventTest {
         eventHandler.removePendingAliasOtcSession(sessionId)
         assertNull(eventHandler.getPendingAliasOtcSession(sessionId))
     }
+
+    @Test
+    fun testPendingReloginOtpSessionCompletesWithOtp(): Unit = runBlocking {
+        val logger = RecordingDiscordLogger()
+        val eventHandler = RecoveryInteractionEvent(
+            recoveryService = RecoveryService(),
+            discordLogger = logger,
+            accountRepository = stubAccountRepository,
+        )
+
+        val sessionId = "relogin-session-789"
+        val deferred = CompletableDeferred<String>()
+        eventHandler.setPendingReloginOtpSession(sessionId, deferred)
+
+        val rawOtp = "654321"
+        eventHandler.getPendingReloginOtpSession(sessionId)?.complete(rawOtp)
+
+        val result = deferred.await()
+        assertEquals("654321", result)
+
+        eventHandler.removePendingReloginOtpSession(sessionId)
+        assertNull(eventHandler.getPendingReloginOtpSession(sessionId))
+    }
+
+    @Test
+    fun testPrepareRecoveryAccountRejectsPartialSuccess(): Unit = runBlocking {
+        val existingAccount = RecoveredAccount(
+            originalEmail = "partial@example.com",
+            status = RecoveredAccount.STATUS_SUCCESS_PARTIAL,
+        )
+        val customRepo = object : AccountRepository {
+            override suspend fun saveAccount(account: RecoveredAccount): Boolean = true
+            override suspend fun getAccountByEmail(email: String): RecoveredAccount? = null
+            override suspend fun getAccountByOriginalEmail(originalEmail: String): RecoveredAccount? =
+                if (originalEmail == "partial@example.com") existingAccount else null
+            override suspend fun updateMinecraftStatus(email: String, owns: Boolean): Unit = Unit
+            override suspend fun updateStatus(originalEmail: String, status: String, failReason: String?): Boolean = true
+            override suspend fun deleteByOriginalEmail(originalEmail: String): Boolean = true
+            override suspend fun getAllAccounts(): List<RecoveredAccount> = emptyList()
+        }
+
+        val eventHandler = RecoveryInteractionEvent(
+            recoveryService = RecoveryService(),
+            discordLogger = RecordingDiscordLogger(),
+            accountRepository = customRepo,
+        )
+
+        val canProceed = eventHandler.prepareRecoveryAccount("partial@example.com")
+        assertEquals(false, canProceed)
+    }
 }

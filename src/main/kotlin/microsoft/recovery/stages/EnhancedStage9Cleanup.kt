@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import microsoft.recovery.alias.MfaRequiredException
 import microsoft.recovery.context.RecoveryContext
 import microsoft.recovery.model.PasskeyRemovalRequest
 import microsoft.recovery.model.ProofRemovalRequest
@@ -122,6 +123,11 @@ class EnhancedStage9Cleanup(
         context.activeCanary = activeCanary
         stageListener?.invoke("9", "Cleanup", true, "All authentication proofs revoked and sessions terminated")
         StageExecution.Success(Unit)
+    } catch (e: MfaRequiredException) {
+        val msg = "Security cleanup failed: ${e.message}"
+        logger.error(msg, e)
+        stageListener?.invoke("9", "Cleanup", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SECURITY_CLEANUP, msg, cause = e))
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
@@ -169,6 +175,11 @@ class EnhancedStage9Cleanup(
 
                 val errorElement = jsonObject?.get("error")
                 if (errorElement != null && errorElement !is JsonNull) {
+                    val errorStr = errorElement.toString()
+                    if (actionName.contains("DisableTfa", ignoreCase = true) && (errorStr.contains("\"code\":\"6001\"") || errorStr.contains("\"6001\""))) {
+                        logger.error("DisableTfa returned error 6001 (MFA required). Aborting retries.")
+                        throw MfaRequiredException("DisableTfa failed with API error: $errorElement")
+                    }
                     throw IllegalStateException("$actionName failed with API error: $errorElement")
                 }
 
@@ -180,6 +191,8 @@ class EnhancedStage9Cleanup(
                     currentCanary = updatedCanary
                 }
                 return currentCanary
+            } catch (e: MfaRequiredException) {
+                throw e
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

@@ -38,8 +38,12 @@ class Stage3Polish(
         stageListener: StageListener?,
     ): StageExecution<Unit> = try {
         val loginCookies = context.cookieStorage.get(Url("https://login.live.com"))
-        val currentUaid = loginCookies.firstOrNull { it.name == "uaid" }?.value ?: context.uaid
+        val accountCookies = context.cookieStorage.get(Url("https://account.live.com"))
+        val currentUaid = loginCookies.firstOrNull { it.name == "uaid" }?.value
+            ?: accountCookies.firstOrNull { it.name == "uaid" }?.value
+            ?: context.uaid
         val msaAuthValue = loginCookies.firstOrNull { it.name == "__Host-MSAAUTH" }?.value
+            ?: accountCookies.firstOrNull { it.name == "__Host-MSAAUTH" }?.value
 
         if (msaAuthValue.isNullOrBlank()) {
             val msg = "Missing __Host-MSAAUTH cookie for session stabilization"
@@ -356,17 +360,16 @@ $htmlSnippet
         response: io.ktor.client.statement.HttpResponse,
         cookieStorage: CookiesStorage,
     ): Boolean {
-        val existingAccountCookies = cookieStorage.get(Url("https://account.live.com"))
         val setCookieHeaders = response.headers.getAll(HttpHeaders.SetCookie).orEmpty()
         for (rawCookie in setCookieHeaders) {
-            if (rawCookie.contains("AMRPSSecAuth=") && existingAccountCookies.none { it.name == "AMRPSSecAuth" }) {
+            if (rawCookie.contains("AMRPSSecAuth=")) {
                 val value = rawCookie.substringAfter("AMRPSSecAuth=").substringBefore(";")
                 cookieStorage.addCookie(
                     Url("https://account.live.com"),
                     Cookie(name = "AMRPSSecAuth", value = value, domain = "account.live.com", path = "/", secure = true),
                 )
             }
-            if (rawCookie.contains("amsc=") && existingAccountCookies.none { it.name == "amsc" }) {
+            if (rawCookie.contains("amsc=")) {
                 val value = rawCookie.substringAfter("amsc=").substringBefore(";")
                 cookieStorage.addCookie(
                     Url("https://account.live.com"),

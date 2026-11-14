@@ -57,6 +57,7 @@ class RecoveryService(
         accountRepository = accountRepository,
         stageDelayMs = stageDelayMs,
         stopAfterStage7 = stopAfterStage7,
+        clientEngine = clientEngine,
     )
 
     override fun close() {
@@ -69,6 +70,7 @@ class RecoveryService(
         newEmail: String? = null,
         stageListener: StageListener? = null,
         aliasOtcProvider: (suspend (String) -> String)? = null,
+        reloginOtpProvider: (suspend () -> String)? = null,
     ): RecoveryResult {
         if (email.isBlank()) {
             return RecoveryResult.Failure(RecoveryStage.CREDENTIAL_DISCOVERY, "Email cannot be blank")
@@ -103,6 +105,7 @@ class RecoveryService(
             httpClient = client,
             otpProvider = otpProvider,
             aliasOtcProvider = aliasOtcProvider,
+            reloginOtpProvider = reloginOtpProvider,
         )
 
         return try {
@@ -123,6 +126,7 @@ class RecoveryService(
             )
         } finally {
             client.close()
+            context.httpClient.takeIf { it !== client }?.close()
         }
     }
 }

@@ -8,3 +8,5 @@ class SessionExpiredException(
     message: String,
     val redirectLocation: String? = null,
 ) : RuntimeException(message)
+
+class MfaRequiredException(message: String) : RuntimeException(message)

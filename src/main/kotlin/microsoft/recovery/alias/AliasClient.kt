@@ -503,6 +503,7 @@ class AliasClient(
             newEmail = newAlias,
             uaid = makePrimaryUaid,
             httpClient = httpClient,
+            cookieStorage = targetStorage,
         )
         activeCanary = primaryCanary ?: activeCanary
 
@@ -510,6 +511,7 @@ class AliasClient(
             canary = activeCanary,
             oldEmail = oldEmail,
             httpClient = httpClient,
+            cookieStorage = targetStorage,
         )
 
         return AliasRotationResult(
@@ -813,6 +815,7 @@ class AliasClient(
         uaid: String,
         httpClient: HttpClient,
         tcxt: String = "",
+        cookieStorage: CookiesStorage? = null,
     ): String? {
         val decodedCanary = decodeUnicodeCanary(apiCanary)
         val payloadJson = buildJsonObject {
@@ -825,10 +828,12 @@ class AliasClient(
             put("hpgid", 200176)
         }.toString()
 
+        val cookieHeader = cookieStorage?.let { buildStage8CookieHeader(httpClient, it, "POST /MakePrimary").first }
+
         val response = httpClient.post("https://account.live.com/API/MakePrimary") {
             header(HttpHeaders.Accept, "application/json")
             header(HttpHeaders.Origin, "https://account.live.com")
-            header(HttpHeaders.Referrer, "https://account.live.com/names/Manage")
+            header("Referer", "https://account.live.com/names/Manage")
             header("X-Requested-With", "XMLHttpRequest")
             header("canary", decodedCanary)
             header("scid", "100141")
@@ -839,6 +844,9 @@ class AliasClient(
             header("x-ms-apiTransport", "xhr")
             header("x-ms-apiVersion", "2")
             header(HttpHeaders.ContentType, "application/x-www-form-urlencoded; charset=UTF-8")
+            if (!cookieHeader.isNullOrBlank()) {
+                header(HttpHeaders.Cookie, cookieHeader)
+            }
             contentType(ContentType.parse("application/x-www-form-urlencoded; charset=UTF-8"))
             setBody(TextContent(payloadJson, ContentType.parse("application/x-www-form-urlencoded; charset=UTF-8")))
         }
@@ -888,8 +896,10 @@ class AliasClient(
         canary: String,
         oldEmail: String,
         httpClient: HttpClient,
+        cookieStorage: CookiesStorage? = null,
     ): Boolean {
         val decodedCanary = decodeUnicodeCanary(canary)
+        val cookieHeader = cookieStorage?.let { buildStage8CookieHeader(httpClient, it, "POST /names/Manage").first }
         val response = httpClient.submitForm(
             url = "https://account.live.com/names/manage",
             formParameters = parameters {
@@ -901,8 +911,11 @@ class AliasClient(
         ) {
             header(HttpHeaders.Accept, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             header(HttpHeaders.Origin, "https://account.live.com")
-            header(HttpHeaders.Referrer, "https://account.live.com/names/Manage")
+            header("Referer", "https://account.live.com/names/Manage")
             header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+            if (!cookieHeader.isNullOrBlank()) {
+                header(HttpHeaders.Cookie, cookieHeader)
+            }
         }
 
         if (!response.status.isSuccess() &&
