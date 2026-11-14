@@ -79,6 +79,7 @@ class AliasClientTest {
                 }
 
                 path == "/AddAssocId" -> {
+                    assertEquals("ru=&cru=&fl=", request.url.encodedQuery)
                     addAssocHeaderCanary = request.headers["canary"]
                     addAssocCookieHeader = request.headers[HttpHeaders.Cookie]
                     addAssocReferer = request.headers["Referer"]
@@ -90,9 +91,16 @@ class AliasClientTest {
                     addAssocSingleDomain = formData?.get("SingleDomain")
                     addAssocUpSell = formData?.get("UpSell")
                     addAssocOptions = formData?.get("AddAssocIdOptions")
-                    addAssocLive = formData?.get("AssociatedIdLive")
+                    addAssocLive = formData?.get("AssociatedIdEasi")
                     addAssocUaid = formData?.get("uaid")
-                    respond("<html>Added</html>", HttpStatusCode.OK)
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://account.live.com/names/Manage?noteid=Note_AssociatedIdAdded&alias=ab12cd%40qhuyy.tech",
+                        ),
+                    )
                 }
 
                 path == "/get-otc" -> {
@@ -115,24 +123,58 @@ class AliasClientTest {
                     verifyUserAgent = request.headers[HttpHeaders.UserAgent]
                     assertEquals("mock_otc_token_123", request.url.parameters["otc"])
                     assertEquals("Email", request.url.parameters["aliastype"])
-                    respond("<html>Verified</html>", HttpStatusCode.OK)
+                    assertEquals("ab12cd@qhuyy.tech", request.url.parameters["aliasname"])
+                    assertEquals("old_user@outlook.com", request.url.parameters["mn"])
+                    assertEquals("ALS", request.url.parameters["cxt"])
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://account.live.com/names/Manage?noteid=Note_AssociatedIdConfirmed&alias=ab12cd%40qhuyy.tech",
+                        ),
+                    )
+                }
+
+                (path == "/names/Manage" || path == "/names/manage") && request.method == io.ktor.http.HttpMethod.Get -> {
+                    respond(
+                        content = """<html><input name="canary" value="verified_form_canary" /><script>var ServerData={"apiCanary":"verified_api_canary\u002b123\/xyz"};</script>Note_AssociatedIdConfirmed</html>""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
                 }
 
                 path == "/API/MakePrimary" -> {
                     makePrimaryCanary = request.headers["canary"]
+                    assertEquals("100141", request.headers["scid"])
+                    assertEquals("200176", request.headers["hpgid"])
+                    assertEquals("2", request.headers["x-ms-apiVersion"])
+                    assertEquals("XMLHttpRequest", request.headers["X-Requested-With"])
+                    val ct = request.headers[HttpHeaders.ContentType] ?: (request.body as? io.ktor.http.content.OutgoingContent)?.contentType?.toString()
+                    assertTrue(ct?.contains("application/x-www-form-urlencoded") == true)
+                    val bodyString = (request.body as? io.ktor.content.TextContent)?.text ?: ""
+                    assertTrue(bodyString.contains(""""aliasName":"ab12cd@qhuyy.tech""""))
+                    assertTrue(bodyString.contains(""""emailChecked":false"""))
                     respond(
-                        content = """{"apiCanary":"updated_canary_from_make_primary"}""",
+                        content = """{"apiCanary":"updated_canary_from_make_primary\u002fnew"}""",
                         status = HttpStatusCode.OK,
                         headers = headersOf(HttpHeaders.ContentType, "application/json"),
                     )
                 }
 
-                path == "/names/manage" -> {
+                (path == "/names/manage" || path == "/names/Manage") && request.method == io.ktor.http.HttpMethod.Post -> {
                     removeAliasAction = "RemoveAlias"
+                    val formData = (request.body as? FormDataContent)?.formData
+                    assertEquals("updated_canary_from_make_primary/new", formData?.get("canary"))
+                    assertEquals("RemoveAlias", formData?.get("action"))
+                    assertEquals("old_user@outlook.com", formData?.get("aliasName"))
                     respond(
-                        content = "<html>Note_AssociatedIdRemoved</html>",
-                        status = HttpStatusCode.OK,
-                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://account.live.com/names/Manage?noteid=Note_AssociatedIdRemoved",
+                        ),
                     )
                 }
 
@@ -189,20 +231,20 @@ class AliasClientTest {
 
         assertEquals("old_user@outlook.com", result.oldEmail)
         assertEquals("ab12cd@qhuyy.tech", result.newEmail)
-        assertEquals("updated_canary_from_make_primary", result.updatedCanary)
+        assertEquals("updated_canary_from_make_primary/new", result.updatedCanary)
         assertEquals("fresh_canary_stage8", addAssocHeaderCanary)
         assertEquals("fresh_canary_stage8", addAssocFormCanary)
         assertEquals("NONE", addAssocPostOption)
-        assertEquals("outlook.com", addAssocSingleDomain)
+        assertEquals("", addAssocSingleDomain)
         assertEquals("", addAssocUpSell)
-        assertEquals("LIVE", addAssocOptions)
-        assertEquals("ab12cd", addAssocLive)
+        assertEquals("EASI", addAssocOptions)
+        assertEquals("ab12cd@qhuyy.tech", addAssocLive)
         assertEquals(null, addAssocUaid)
         assertEquals(
-            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdLive"),
+            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdEasi"),
             addAssocParamKeys,
         )
-        assertEquals("https://account.live.com/proofs/manage/additional", addAssocReferer)
+        assertEquals("https://account.live.com/AddAssocId", addAssocReferer)
         assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, refreshUserAgent)
         assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, addAssocUserAgent)
         assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, verifyUserAgent)
@@ -216,7 +258,7 @@ class AliasClientTest {
         assertTrue(verifyCookiesHeader?.contains("__Host-MSAAUTH=msa_auth_val") == true)
         assertTrue(verifyCookiesHeader?.contains("AMRPSSecAuth=amrp_val") == true)
         assertTrue(verifyCookiesHeader?.contains("amsc=amsc_val_secret_1234") == true)
-        assertEquals("fresh_canary_stage8", makePrimaryCanary)
+        assertEquals("verified_api_canary+123/xyz", makePrimaryCanary)
         assertEquals("RemoveAlias", removeAliasAction)
     }
 
@@ -483,7 +525,7 @@ class AliasClientTest {
     fun testAddAssocIdOmitsUaidWhenLoginCookieMissing(): Unit = runBlocking {
         var addAssocParamKeys: Set<String> = emptySet()
         var addAssocUaid: String? = "unexpected"
-        var addAssocLive: String? = null
+        var addAssocEasi: String? = null
         val debugPayloads = mutableListOf<String>()
 
         val mockEngine = MockEngine { request ->
@@ -496,7 +538,7 @@ class AliasClientTest {
                     val formData = (request.body as? FormDataContent)?.formData
                     addAssocParamKeys = formData?.names().orEmpty()
                     addAssocUaid = formData?.get("uaid")
-                    addAssocLive = formData?.get("AssociatedIdLive")
+                    addAssocEasi = formData?.get("AssociatedIdEasi")
                     respond("<html>Added</html>", HttpStatusCode.OK)
                 }
                 "/Aliases/Verify" -> respond("<html>Verified</html>", HttpStatusCode.OK)
@@ -546,10 +588,245 @@ class AliasClientTest {
         )
 
         assertEquals(null, addAssocUaid)
-        assertEquals("lencak480", addAssocLive)
+        assertEquals("lencak480@qhuyy.tech", addAssocEasi)
         assertEquals(
-            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdLive"),
+            setOf("canary", "PostOption", "SingleDomain", "UpSell", "AddAssocIdOptions", "AssociatedIdEasi"),
             addAssocParamKeys,
         )
+    }
+
+    @Test
+    fun testAddExternalAliasDirectly(): Unit = runBlocking {
+        var capturedQuery: String? = null
+        var capturedCanary: String? = null
+        var capturedSingleDomain: String? = null
+        var capturedOptions: String? = null
+        var capturedEasi: String? = null
+        var capturedReferer: String? = null
+        var capturedOrigin: String? = null
+
+        val mockEngine = MockEngine { request ->
+            capturedQuery = request.url.encodedQuery
+            capturedCanary = request.headers["canary"]
+            capturedReferer = request.headers["Referer"]
+            capturedOrigin = request.headers["Origin"]
+            val form = (request.body as? FormDataContent)?.formData
+            capturedSingleDomain = form?.get("SingleDomain")
+            capturedOptions = form?.get("AddAssocIdOptions")
+            capturedEasi = form?.get("AssociatedIdEasi")
+            respond(
+                content = "",
+                status = HttpStatusCode.Found,
+                headers = headersOf(
+                    HttpHeaders.Location,
+                    "https://account.live.com/names/Manage?noteid=Note_AssociatedIdAdded&alias=new%40qhuyy.tech",
+                ),
+            )
+        }
+
+        val cookieStorage = AcceptAllCookiesStorage()
+        cookieStorage.addCookie(
+            Url("https://account.live.com"),
+            Cookie(name = "AMRPSSecAuth", value = "amrp_val", domain = "account.live.com", path = "/"),
+        )
+        val httpClient = HttpClient(mockEngine)
+        val client = AliasClient()
+
+        val success = client.addExternalAlias(
+            canary = "test_canary_abc",
+            newEmail = "new@qhuyy.tech",
+            httpClient = httpClient,
+            cookieStorage = cookieStorage,
+        )
+
+        assertTrue(success)
+        assertEquals("ru=&cru=&fl=", capturedQuery)
+        assertEquals("test_canary_abc", capturedCanary)
+        assertEquals("", capturedSingleDomain)
+        assertEquals("EASI", capturedOptions)
+        assertEquals("new@qhuyy.tech", capturedEasi)
+        assertEquals("https://account.live.com/AddAssocId", capturedReferer)
+        assertEquals("https://account.live.com", capturedOrigin)
+    }
+
+    @Test
+    fun testVerifyAliasViaLinkWithRedirectAndUnicodeCanary(): Unit = runBlocking {
+        var capturedVerifyCookie: String? = null
+        var followedRedirect = false
+
+        val mockEngine = MockEngine { request ->
+            val path = request.url.encodedPath
+            when {
+                path == "/Aliases/Verify" -> {
+                    capturedVerifyCookie = request.headers[HttpHeaders.Cookie]
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Found,
+                        headers = headersOf(
+                            HttpHeaders.Location,
+                            "https://account.live.com/names/Manage?noteid=Note_AssociatedIdConfirmed&alias=test%40qhuyy.tech",
+                        ),
+                    )
+                }
+                path == "/names/Manage" && request.method == io.ktor.http.HttpMethod.Get -> {
+                    followedRedirect = true
+                    respond(
+                        content = """
+                            <html>
+                            <input name="canary" value="form_canary_xyz" />
+                            <script>var ServerData = {"apiCanary":"api_canary\u002bplus\u002fslash\u003acolon\u003dequal\/escaped"};</script>
+                            <div>Note_AssociatedIdConfirmed</div>
+                            </html>
+                        """.trimIndent(),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "text/html"),
+                    )
+                }
+                else -> error("Unexpected request path: $path")
+            }
+        }
+
+        val cookieStorage = AcceptAllCookiesStorage()
+        cookieStorage.addCookie(
+            Url("https://login.live.com"),
+            Cookie(name = "__Host-MSAAUTH", value = "msa_val", domain = "login.live.com", path = "/", secure = true),
+        )
+        cookieStorage.addCookie(
+            Url("https://account.live.com"),
+            Cookie(name = "AMRPSSecAuth", value = "amrp_val", domain = "account.live.com", path = "/", secure = true),
+        )
+        cookieStorage.addCookie(
+            Url("https://account.live.com"),
+            Cookie(name = "amsc", value = "amsc_val", domain = "account.live.com", path = "/", secure = true),
+        )
+
+        val httpClient = HttpClient(mockEngine)
+        val client = AliasClient()
+
+        val result = client.verifyAliasViaLink(
+            httpClient = httpClient,
+            verifyUrl = "https://account.live.com/Aliases/Verify?aliasname=test%40qhuyy.tech&aliastype=Email&otc=123456&mn=orig%40gmail.com&cxt=ALS",
+            cookieStorage = cookieStorage,
+        )
+
+        assertTrue(result.isConfirmed)
+        assertTrue(followedRedirect)
+        assertEquals("form_canary_xyz", result.newCanary)
+        assertEquals("api_canary+plus/slash:colon=equal/escaped", result.newApiCanary)
+        assertTrue(capturedVerifyCookie?.contains("__Host-MSAAUTH=msa_val") == true)
+        assertTrue(capturedVerifyCookie?.contains("AMRPSSecAuth=amrp_val") == true)
+        assertTrue(capturedVerifyCookie?.contains("amsc=amsc_val") == true)
+    }
+
+    @Test
+    fun testBuildVerifyUrl() {
+        val client = AliasClient()
+        val url = client.buildVerifyUrl(
+            newEmail = "callmebirri@qhuyy.tech",
+            originalEmail = "callmebirri@gmail.com",
+            otc = "*Dj4eUrBrwgAYE5GYl8o0zNmv7w0YQcmLAuA8b76OGyCvGVXZvpH9fIAqoZIYYg*NolBEkTMa2W1C9r1kCjpuhgY$",
+        )
+        assertEquals(
+            "https://account.live.com/Aliases/Verify?aliasname=callmebirri%40qhuyy.tech&aliastype=Email&otc=*Dj4eUrBrwgAYE5GYl8o0zNmv7w0YQcmLAuA8b76OGyCvGVXZvpH9fIAqoZIYYg*NolBEkTMa2W1C9r1kCjpuhgY%24&mn=callmebirri%40gmail.com&cxt=ALS",
+            url,
+        )
+    }
+
+    @Test
+    fun testMakePrimaryWithUrlEncodedJsonBodyAndNewHeaders(): Unit = runBlocking {
+        var capturedCanaryHeader: String? = null
+        var capturedScid: String? = null
+        var capturedHpgid: String? = null
+        var capturedApiVersion: String? = null
+        var capturedRequestedWith: String? = null
+        var capturedContentType: String? = null
+        var capturedBodyText: String? = null
+
+        val mockEngine = MockEngine { request ->
+            capturedCanaryHeader = request.headers["canary"]
+            capturedScid = request.headers["scid"]
+            capturedHpgid = request.headers["hpgid"]
+            capturedApiVersion = request.headers["x-ms-apiVersion"]
+            capturedRequestedWith = request.headers["X-Requested-With"]
+            capturedContentType = request.headers[HttpHeaders.ContentType] ?: (request.body as? io.ktor.http.content.OutgoingContent)?.contentType?.toString()
+            capturedBodyText = (request.body as? io.ktor.content.TextContent)?.text
+            respond(
+                content = """{"apiCanary":"fresh_api_canary\u002bdecoded\u002fok"}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json"),
+            )
+        }
+
+        val httpClient = HttpClient(mockEngine)
+        val client = AliasClient()
+
+        val nextCanary = client.makePrimary(
+            apiCanary = "input_canary\\u002bencoded",
+            newEmail = "user@qhuyy.tech",
+            uaid = "33c159a8c91d462b9c737d4fd1e70f18",
+            httpClient = httpClient,
+        )
+
+        assertEquals("fresh_api_canary+decoded/ok", nextCanary)
+        assertEquals("input_canary+encoded", capturedCanaryHeader)
+        assertEquals("100141", capturedScid)
+        assertEquals("200176", capturedHpgid)
+        assertEquals("2", capturedApiVersion)
+        assertEquals("XMLHttpRequest", capturedRequestedWith)
+        assertTrue(capturedContentType?.contains("application/x-www-form-urlencoded") == true)
+        assertTrue(capturedBodyText?.contains(""""aliasName":"user@qhuyy.tech"""") == true)
+        assertTrue(capturedBodyText?.contains(""""emailChecked":false""") == true)
+        assertTrue(capturedBodyText?.contains(""""removeOldPrimary":false""") == true)
+        assertTrue(capturedBodyText?.contains(""""scid":100141""") == true)
+        assertTrue(capturedBodyText?.contains(""""hpgid":200176""") == true)
+        assertTrue(capturedBodyText?.contains(""""uaid":"33c159a8c91d462b9c737d4fd1e70f18"""") == true)
+    }
+
+    @Test
+    fun testRemoveOldAliasWithRefreshedCanary(): Unit = runBlocking {
+        var capturedFormCanary: String? = null
+        var capturedAction: String? = null
+        var capturedAliasName: String? = null
+
+        val mockEngine = MockEngine { request ->
+            val form = (request.body as? FormDataContent)?.formData
+            capturedFormCanary = form?.get("canary")
+            capturedAction = form?.get("action")
+            capturedAliasName = form?.get("aliasName")
+            respond(
+                content = "",
+                status = HttpStatusCode.Found,
+                headers = headersOf(
+                    HttpHeaders.Location,
+                    "https://account.live.com/names/Manage?noteid=Note_AssociatedIdRemoved",
+                ),
+            )
+        }
+
+        val httpClient = HttpClient(mockEngine)
+        val client = AliasClient()
+
+        val removed = client.removeOldAlias(
+            canary = "raw_canary\\u002ftest",
+            oldEmail = "victim@gmail.com",
+            httpClient = httpClient,
+        )
+
+        assertTrue(removed)
+        assertEquals("raw_canary/test", capturedFormCanary)
+        assertEquals("RemoveAlias", capturedAction)
+        assertEquals("victim@gmail.com", capturedAliasName)
+    }
+
+    @Test
+    fun testDecodeUnicodeCanaryHelper() {
+        val client = AliasClient()
+        val raw = """PDr1\/w9r9i+lpCYSBh5+Zv\/DbrCp4OBzJvN8a\/5Mr0Ro0fEkeBfHc0jQLJgEC2yi5Nep76++WcZm9qpWT8hKsIDVn\/TnUXuCeqKBc9w\/9kwOti6sQugIbuk\/be\/ALbzT59ENR+wWHaV6\/54YK\/Ru3tjNzKKJdeZA+9ZoMNAtmod7HNnAJ5zs3n7rsJCX+hXIZNE5R90RpPNB0PDZ7HBXuZpHSICi1Sq12PGZ3F3PSMFUepEVsrEdqBj6Sqa+0Jcf:2:3c"""
+        val decoded = client.decodeUnicodeCanary(raw)
+        assertTrue(!decoded.contains("\\/"))
+        assertTrue(decoded.contains("/"))
+
+        val encoded = """token\u002bplus\u002fslash\u003acolon\u003dequal"""
+        assertEquals("token+plus/slash:colon=equal", client.decodeUnicodeCanary(encoded))
     }
 }

@@ -51,6 +51,14 @@ class RecoveryInteractionEvent(
     private val pendingOtpSessions = ConcurrentHashMap<String, CompletableDeferred<String>>()
     private val pendingAliasOtcSessions = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
+    internal fun getPendingAliasOtcSession(sessionId: String): CompletableDeferred<String>? = pendingAliasOtcSessions[sessionId]
+    internal fun setPendingAliasOtcSession(sessionId: String, deferred: CompletableDeferred<String>) {
+        pendingAliasOtcSessions[sessionId] = deferred
+    }
+    internal fun removePendingAliasOtcSession(sessionId: String) {
+        pendingAliasOtcSessions.remove(sessionId)
+    }
+
     internal suspend fun prepareRecoveryAccount(email: String): Boolean = withContext(Dispatchers.IO) {
         if (email.isBlank()) return@withContext true
         try {
@@ -294,10 +302,10 @@ class RecoveryInteractionEvent(
                                     )
                                     runCatching {
                                         initialResponse?.edit {
-                                            content = "Stage 8: Nhấn nút bên dưới (hoặc trong kênh log) để nhập mã OTC cho alias `$alias`:"
+                                            content = "Stage 8: Nhấn nút bên dưới (hoặc trong kênh log) để nhập link xác nhận hoặc mã OTC cho alias `$alias`:"
                                             actionRow {
                                                 interactionButton(ButtonStyle.Primary, "open_alias_otc_modal:$aliasSessionId") {
-                                                    label = "Nhập OTC Alias"
+                                                    label = "Nhập OTC / Link Alias"
                                                 }
                                             }
                                         }
@@ -442,7 +450,7 @@ class RecoveryInteractionEvent(
 
                     runCatching {
                         interaction.respondEphemeral {
-                            content = "Đã nhận mã OTC alias. Đang tiếp tục Stage 8..."
+                            content = "Đã nhận mã OTC / link verify. Đang tiếp tục Stage 8..."
                         }
                     }.onFailure {
                         if (it is CancellationException) {

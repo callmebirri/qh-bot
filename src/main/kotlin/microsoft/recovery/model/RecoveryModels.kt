@@ -120,12 +120,12 @@ data class NotificationProofDetail(
 @Serializable
 data class MakePrimaryRequest(
     val aliasName: String,
-    val emailChecked: Boolean = true,
+    val emailChecked: Boolean = false,
     val removeOldPrimary: Boolean = false,
     val uiflvr: Int = 1001,
     val uaid: String,
-    val scid: Int = 100115,
-    val hpgid: Int = 200650,
+    val scid: Int = 100141,
+    val hpgid: Int = 200176,
 )
 
 @Serializable

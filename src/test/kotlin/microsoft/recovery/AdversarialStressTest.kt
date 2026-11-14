@@ -283,7 +283,7 @@ class AdversarialStressTest {
                     respond(
                         content = "",
                         status = HttpStatusCode.Found,
-                        headers = headersOf(HttpHeaders.Location, "https://account.live.com/proofs/manage/additional"),
+                        headers = headersOf(HttpHeaders.Location, "https://account.live.com/names/Manage?noteid=Note_AssociatedIdAdded"),
                     )
                 }
                 "/Aliases/Verify" -> respond("<html>Verified</html>", HttpStatusCode.OK)
@@ -340,7 +340,7 @@ class AdversarialStressTest {
                 "/AddAssocId" -> respond(
                     content = "",
                     status = HttpStatusCode.Found,
-                    headers = headersOf(HttpHeaders.Location, "https://account.live.com/proofs/manage/additional"),
+                    headers = headersOf(HttpHeaders.Location, "https://account.live.com/names/Manage?noteid=Note_AssociatedIdAdded"),
                 )
                 else -> respondError(HttpStatusCode.NotFound)
             }
@@ -455,7 +455,7 @@ class AdversarialStressTest {
                 "/AddAssocId" -> respond(
                     content = "",
                     status = HttpStatusCode.Found,
-                    headers = headersOf(HttpHeaders.Location, "https://account.live.com/proofs/manage/additional"),
+                    headers = headersOf(HttpHeaders.Location, "https://account.live.com/names/Manage?noteid=Note_AssociatedIdAdded"),
                 )
                 "/API/MakePrimary" -> respond(
                     content = """{"apiCanary":"primary_canary"}""",

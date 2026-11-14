@@ -53,14 +53,17 @@ class Stage8Alias(
         val aliasOtcProvider = context.aliasOtcProvider
         val targetAliasEmail: String
 
-        val clientAlias = aliasClient
-        if (clientAlias != null) {
+        val effectiveAliasClient = aliasClient ?: if (newEmail.endsWith("@qhuyy.tech", ignoreCase = true) ||
+            (newEmail.contains("@") && !newEmail.endsWith("@outlook.com", ignoreCase = true) && !newEmail.endsWith("@hotmail.com", ignoreCase = true))
+        ) AliasClient() else null
+
+        if (effectiveAliasClient != null) {
             val aliasResult = runCatching {
-                clientAlias.rotateAlias(
+                effectiveAliasClient.rotateAlias(
                     currentCanary = activeCanary,
                     oldEmail = email,
                     httpClient = client,
-                    customAlias = if (newEmail.endsWith("@qhuyy.tech", ignoreCase = true)) newEmail else null,
+                    customAlias = if (newEmail.isNotBlank()) newEmail else null,
                     aliasOtcProvider = aliasOtcProvider,
                     cookieStorage = cookieStorage,
                     sessionUaid = uaid,

@@ -956,7 +956,9 @@ class RecoveryServiceTest {
                     )
                 }
                 "/AddAssocId" -> {
-                    capturedAddAliasBody = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData?.get("AssociatedIdLive")
+                    capturedAddAliasBody = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData?.let {
+                        it["AssociatedIdEasi"]?.substringBefore("@") ?: it["AssociatedIdLive"]
+                    }
                     respond("<html>Added</html>", HttpStatusCode.OK)
                 }
                 "/get-otc" -> respond("""{"otc":"112233"}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
@@ -1329,7 +1331,7 @@ class RecoveryServiceTest {
                     addAssocUserAgent = request.headers[HttpHeaders.UserAgent]
                     val form = (request.body as? io.ktor.client.request.forms.FormDataContent)?.formData
                     addAssocParamKeys = form?.names().orEmpty()
-                    addAssocAssociatedIdLive = form?.get("AssociatedIdLive")
+                    addAssocAssociatedIdLive = form?.get("AssociatedIdEasi")?.substringBefore("@") ?: form?.get("AssociatedIdLive")
                     addAssocFormCanary = form?.get("canary")
                     addAssocUaid = form?.get("uaid")
                     respond(
@@ -1369,7 +1371,7 @@ class RecoveryServiceTest {
         assertTrue(!addAssocParamKeys.contains("uaid"))
         assertEquals(1, stage8DebugDetails.size)
         assertTrue(!stage8DebugDetails.single().contains("refreshed_stage8_canary"))
-        assertEquals("https://account.live.com/proofs/manage/additional", addAssocReferer)
+        assertEquals("https://account.live.com/AddAssocId", addAssocReferer)
         assertEquals(MicrosoftHttpClientFactory.DEFAULT_USER_AGENT, addAssocUserAgent)
         assertTrue(addAssocCookie?.contains("AMRPSSecAuth=") == true)
         assertTrue(addAssocCookie?.contains("amsc=") == true)

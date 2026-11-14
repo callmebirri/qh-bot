@@ -3,6 +3,7 @@ package event.events
 import database.model.RecoveredAccount
 import database.repository.AccountRepository
 import discord.DiscordLogger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -313,5 +314,53 @@ class RecoveryInteractionEventTest {
         assertEquals(1, logger.detailedFailures.size)
         val failure = logger.detailedFailures[0]
         assertTrue(failure.debugContext != null)
+    }
+
+    @Test
+    fun testPendingAliasOtcSessionCompletesWithVerifyUrl(): Unit = runBlocking {
+        val logger = RecordingDiscordLogger()
+        val eventHandler = RecoveryInteractionEvent(
+            recoveryService = RecoveryService(),
+            discordLogger = logger,
+            accountRepository = stubAccountRepository,
+        )
+
+        val sessionId = "alias-session-123"
+        val deferred = CompletableDeferred<String>()
+        eventHandler.setPendingAliasOtcSession(sessionId, deferred)
+
+        assertEquals(deferred, eventHandler.getPendingAliasOtcSession(sessionId))
+
+        val fullVerifyUrl = "https://account.live.com/Aliases/Verify?aliasname=test%40qhuyy.tech&aliastype=Email&otc=987654&mn=orig%40gmail.com&cxt=ALS"
+        eventHandler.getPendingAliasOtcSession(sessionId)?.complete(fullVerifyUrl)
+
+        val result = deferred.await()
+        assertEquals(fullVerifyUrl, result)
+
+        eventHandler.removePendingAliasOtcSession(sessionId)
+        assertNull(eventHandler.getPendingAliasOtcSession(sessionId))
+    }
+
+    @Test
+    fun testPendingAliasOtcSessionCompletesWithRawOtcToken(): Unit = runBlocking {
+        val logger = RecordingDiscordLogger()
+        val eventHandler = RecoveryInteractionEvent(
+            recoveryService = RecoveryService(),
+            discordLogger = logger,
+            accountRepository = stubAccountRepository,
+        )
+
+        val sessionId = "alias-session-456"
+        val deferred = CompletableDeferred<String>()
+        eventHandler.setPendingAliasOtcSession(sessionId, deferred)
+
+        val rawOtc = "123456"
+        eventHandler.getPendingAliasOtcSession(sessionId)?.complete(rawOtc)
+
+        val result = deferred.await()
+        assertEquals("123456", result)
+
+        eventHandler.removePendingAliasOtcSession(sessionId)
+        assertNull(eventHandler.getPendingAliasOtcSession(sessionId))
     }
 }
