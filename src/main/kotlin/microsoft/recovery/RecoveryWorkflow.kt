@@ -6,6 +6,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import microsoft.recovery.context.RecoveryContext
 import microsoft.recovery.model.RecoveryResult
+import microsoft.recovery.model.RecoveryStage
 import microsoft.recovery.model.StageExecution
 import microsoft.recovery.stages.RecoveryStageHandler
 import microsoft.recovery.stages.StageListener
@@ -38,11 +39,19 @@ class RecoveryWorkflow(
         val stage2Result = stage2.execute(context, stageListener)
         if (stage2Result is StageExecution.Failure) return stage2Result.result
 
+        delay(2500L)
+
         val stage3Result = stage3.execute(context, stageListener)
         if (stage3Result is StageExecution.Failure) return stage3Result.result
 
         val stage4Result = stage4.execute(context, stageListener)
         if (stage4Result is StageExecution.Failure) return stage4Result.result
+
+        context.proofsData?.let { proofs ->
+            if (context.emailProofs.isEmpty()) context.emailProofs = proofs.emailProofs
+            if (context.smsProofs.isEmpty()) context.smsProofs = proofs.smsProofs
+            if (context.passKeyIds.isEmpty()) context.passKeyIds = proofs.passKeyIds
+        }
 
         val stage5Result = stage5.execute(context, stageListener)
         if (stage5Result is StageExecution.Failure) return stage5Result.result
@@ -61,12 +70,31 @@ class RecoveryWorkflow(
         } else {
             if (stageDelayMs > 0) delay(stageDelayMs)
 
-            val stage8Result = stage8.execute(context, stageListener)
-            if (stage8Result is StageExecution.Failure) return stage8Result.result
+            val stage8Result = try {
+                stage8.execute(context, stageListener)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("Stage 8 execution failed: {}", e.message, e)
+                StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.ALIAS_ROTATION, e.message ?: "Stage 8 error", cause = e))
+            }
 
             if (stageDelayMs > 0) delay(stageDelayMs)
 
+            val proofs = context.proofsData
+            if (context.passKeyIds.isEmpty() && proofs != null) context.passKeyIds = proofs.passKeyIds
+            if (context.emailProofs.isEmpty() && proofs != null) context.emailProofs = proofs.emailProofs
+            if (context.smsProofs.isEmpty() && proofs != null) context.smsProofs = proofs.smsProofs
+
             val stage9Result = stage9.execute(context, stageListener)
+
+            if (stage8Result is StageExecution.Failure) {
+                if (stage9Result is StageExecution.Failure) {
+                    logger.warn("Stage 9 cleanup also failed after Stage 8 failure: {}", stage9Result.result.message)
+                }
+                return stage8Result.result
+            }
+
             if (stage9Result is StageExecution.Failure) return stage9Result.result
         }
 

@@ -17,6 +17,7 @@ import io.ktor.http.Url
 import io.ktor.http.parameters
 import io.ktor.http.parseServerSetCookieHeader
 import kotlinx.coroutines.CancellationException
+import microsoft.recovery.alias.SessionExpiredException
 import microsoft.recovery.context.RecoveryContext
 import microsoft.recovery.model.RecoveryResult
 import microsoft.recovery.model.RecoveryStage
@@ -50,24 +51,18 @@ class Stage3Polish(
 
             val isolatedClient = if (clientEngine != null) {
                 HttpClient(clientEngine) {
-                    followRedirects = true
-                    install(HttpRedirect) { checkHttpMethod = false }
-                    install(HttpCookies) {
-                        this.storage = context.cookieStorage
-                    }
+                    followRedirects = false
                 }
             } else {
                 HttpClient(OkHttp.create()) {
-                    followRedirects = true
-                    install(HttpRedirect) { checkHttpMethod = false }
-                    install(HttpCookies) {
-                        this.storage = context.cookieStorage
-                    }
+                    followRedirects = false
                 }
             }
 
             val polishResponse = isolatedClient.use { clientInstance ->
                 clientInstance.get(stabilizationUrl) {
+                    header(HttpHeaders.Cookie, cleanCookieHeader)
+                    header("Referer", "https://login.live.com/")
                     header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
                     header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
                     header(
@@ -79,7 +74,7 @@ class Stage3Polish(
                     header("Sec-Ch-Ua-Platform", "\"Windows\"")
                     header("Sec-Fetch-Dest", "document")
                     header("Sec-Fetch-Mode", "navigate")
-                    header("Sec-Fetch-Site", "same-site")
+                    header("Sec-Fetch-Site", "same-origin")
                     header("Sec-Fetch-User", "?1")
                     header("Upgrade-Insecure-Requests", "1")
                 }
@@ -97,16 +92,67 @@ class Stage3Polish(
                 }
             }
 
-            val initialUrl = polishResponse.request.url.toString().ifBlank { stabilizationUrl }
-            val responseBodyString = polishResponse.bodyAsText()
+            var activeResponse = polishResponse
+            var initialUrl = polishResponse.request.url.toString().ifBlank { stabilizationUrl }
+            var responseBodyString = activeResponse.bodyAsText()
+
+            if (activeResponse.status.value in 300..399 || activeResponse.headers[HttpHeaders.Location] != null) {
+                val redirectLocation = activeResponse.headers[HttpHeaders.Location]
+                logger.info("Stage 3 intercepted redirect: status={}, location={}", activeResponse.status, redirectLocation)
+                if (!redirectLocation.isNullOrBlank()) {
+                    val tokenInLocation = Regex("""[?&#]t=([^&#]+)""").find(redirectLocation)?.groupValues?.get(1)
+                    if (tokenInLocation == null && !redirectLocation.contains("/proofs/Add", ignoreCase = true)) {
+                        val resolvedUrl = if (redirectLocation.startsWith("http://") || redirectLocation.startsWith("https://")) {
+                            redirectLocation
+                        } else {
+                            "https://login.live.com${if (redirectLocation.startsWith("/")) "" else "/"}$redirectLocation"
+                        }
+                        val redirectClient = if (clientEngine != null) {
+                            HttpClient(clientEngine) { followRedirects = false }
+                        } else {
+                            HttpClient(OkHttp.create()) { followRedirects = false }
+                        }
+                        activeResponse = redirectClient.use { clientInstance ->
+                            clientInstance.get(resolvedUrl) {
+                                header(HttpHeaders.Cookie, cleanCookieHeader)
+                                header("Referer", "https://login.live.com/")
+                                header(HttpHeaders.UserAgent, MicrosoftHttpClientFactory.DEFAULT_USER_AGENT)
+                                header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
+                                header(
+                                    HttpHeaders.Accept,
+                                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                                )
+                                header("Sec-Fetch-Site", "same-origin")
+                                header("Sec-Fetch-Mode", "navigate")
+                                header("Sec-Fetch-Dest", "document")
+                                header("Sec-Fetch-User", "?1")
+                            }
+                        }
+                        for (rawHeader in activeResponse.headers.getAll(HttpHeaders.SetCookie).orEmpty()) {
+                            val parsed = runCatching { parseServerSetCookieHeader(rawHeader) }.getOrNull()
+                            if (parsed != null && parsed.name.isNotBlank()) {
+                                val targetDomain = parsed.domain ?: "login.live.com"
+                                val targetUrl = Url(if (targetDomain.contains("account.live.com")) "https://account.live.com" else "https://login.live.com")
+                                context.cookieStorage.addCookie(
+                                    targetUrl,
+                                    parsed.copy(domain = targetDomain, path = parsed.path ?: "/"),
+                                )
+                            }
+                        }
+                        initialUrl = resolvedUrl
+                        responseBodyString = activeResponse.bodyAsText()
+                    }
+                }
+            }
+
             val parsedDoc = Jsoup.parse(responseBodyString, initialUrl)
             val htmlTitle = parsedDoc.title()
             val hasPpftInitial = Stage3Parser.hasPpftInput(responseBodyString)
             val htmlSnippet = responseBodyString.take(500).replace("\r", "").replace("\n", " ")
 
             logger.info("=== STAGE 3 DEBUG ===")
-            logger.info("HTTP Status: {}", polishResponse.status)
-            logger.info("Location Header: {}", polishResponse.headers[HttpHeaders.Location] ?: "none")
+            logger.info("HTTP Status: {}", activeResponse.status)
+            logger.info("Location Header: {}", activeResponse.headers[HttpHeaders.Location] ?: "none")
             logger.info("HTML Length: {}", responseBodyString.length)
             logger.info("HTML Title: {}", htmlTitle)
             if (hasPpftInitial) {
@@ -115,8 +161,8 @@ class Stage3Polish(
             logger.info("HTML Snippet: {}", htmlSnippet)
 
             val debugLogDetail = """
-Status: `${polishResponse.status}` | Title: `$htmlTitle` | Length: `${responseBodyString.length}`
-Location: `${polishResponse.headers[HttpHeaders.Location] ?: "none"}` | PPFT: `$hasPpftInitial`
+Status: `${activeResponse.status}` | Title: `$htmlTitle` | Length: `${responseBodyString.length}`
+Location: `${activeResponse.headers[HttpHeaders.Location] ?: "none"}` | PPFT: `$hasPpftInitial`
 ```html
 $htmlSnippet
 ```
@@ -167,8 +213,10 @@ $htmlSnippet
                 stageListener?.invoke("3", "Session Polish", true, "AMRPSSecAuth received")
                 StageExecution.Success(Unit)
             } else {
-                val hasPpft = Stage3Parser.hasPpftInput(currentHtml)
-                val tokenT = Stage3Parser.extractTokenT(currentHtml, currentDoc)
+                val locationToken = polishResponse.headers[HttpHeaders.Location]?.let { loc ->
+                    Regex("""[?&#]t=([^&#]+)""").find(loc)?.groupValues?.get(1)
+                }
+                val tokenT = locationToken ?: Stage3Parser.extractTokenT(currentHtml, currentDoc)
 
                 if (tokenT.isNullOrBlank()) {
                     val bodyText = currentDoc.body().text()
@@ -177,10 +225,6 @@ $htmlSnippet
                     if (bodyText.contains("Protect", ignoreCase = true) || bodyText.contains("Verify", ignoreCase = true)) {
                         val msg = "Microsoft requested additional identity verification (Captcha/2FA). Try again later or use a different IP."
                         stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail\nText: ${bodyText.take(300)}")
-                        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
-                    } else if (hasPpft) {
-                        val msg = "Session expired or invalid, asked to login again."
-                        stageListener?.invoke("3", "Session Polish", false, "$msg\n$debugLogDetail")
                         StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg))
                     } else {
                         val msg = "Token t not found in HTML."
@@ -206,6 +250,11 @@ $htmlSnippet
                 }
             }
         }
+    } catch (e: SessionExpiredException) {
+        val msg = e.message ?: "Session rejected. Microsoft is asking to log in again. (IP may be flagged)"
+        logger.error("Stage 3 SessionExpiredException: {}", msg)
+        stageListener?.invoke("3", "Session Polish", false, msg)
+        StageExecution.Failure(RecoveryResult.Failure(RecoveryStage.SESSION_POLISH, msg, cause = e))
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {

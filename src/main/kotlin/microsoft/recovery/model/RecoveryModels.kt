@@ -145,11 +145,6 @@ data class GenericCanaryResponse(
     val error: RecoveryErrorData? = null,
 )
 
-data class ProofItem(
-    val name: String,
-    val type: String,
-)
-
 data class ManageProofsData(
     val encryptedNetId: String,
     val apiCanary: String,

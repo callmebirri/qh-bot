@@ -249,9 +249,9 @@ object RecoveryParsers {
         return ManageProofsData(
             encryptedNetId = unescapeUnicode(netId),
             apiCanary = unescapeUnicode(canary),
-            emailProofs = parseProofList(emailProofsEl, "Email"),
-            smsProofs = parseProofList(smsProofsEl, "SMS"),
-            passKeyIds = parsePassKeyIds(passKeysEl),
+            emailProofs = ProofExtractorExtensions.parseProofItems(emailProofsEl, "Email"),
+            smsProofs = ProofExtractorExtensions.parseProofItems(smsProofsEl, "SMS"),
+            passKeyIds = ProofExtractorExtensions.extractPasskeyCredentialIds(passKeysEl),
         )
     }
 
@@ -279,30 +279,5 @@ object RecoveryParsers {
             sRecoveryToken = unescapeUnicode(token),
             apiCanary = unescapeUnicode(canary),
         )
-    }
-
-    private fun parseProofList(element: JsonElement?, type: String): List<ProofItem> {
-        val array = (element as? JsonArray) ?: return emptyList()
-        return array.mapNotNull { item ->
-            val name = when (item) {
-                is JsonObject -> item["name"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
-                    ?: item["display"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
-                    ?: item["data"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
-                    ?: item["email"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
-                else -> runCatching { item.jsonPrimitive.content }.getOrNull()
-            }
-            if (!name.isNullOrBlank()) ProofItem(name = unescapeUnicode(name), type = type) else null
-        }
-    }
-
-    private fun parsePassKeyIds(element: JsonElement?): List<String> {
-        val array = (element as? JsonArray) ?: return emptyList()
-        return array.mapNotNull { item ->
-            when (item) {
-                is JsonObject -> item["passKeyId"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
-                    ?: item["id"]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
-                else -> runCatching { item.jsonPrimitive.content }.getOrNull()
-            }?.let(::unescapeUnicode)
-        }
     }
 }

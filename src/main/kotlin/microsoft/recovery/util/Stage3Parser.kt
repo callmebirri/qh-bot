@@ -1,5 +1,7 @@
 package microsoft.recovery.util
 
+import microsoft.recovery.alias.SessionExpiredException
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
 object Stage3Parser {
@@ -9,6 +11,8 @@ object Stage3Parser {
         Regex("""value=["']([^"']+)["']\s+name=["']t["']"""),
         Regex("""["']t["']\s*:\s*["']([^"']+)["']"""),
     )
+
+    private val ppftRegex = Regex("""name=\\?["']PPFT\\?["']""", RegexOption.IGNORE_CASE)
 
     fun hasDoSubmitForm(html: String, doc: Document): Boolean {
         return html.contains("DoSubmit()", ignoreCase = true) ||
@@ -48,8 +52,14 @@ object Stage3Parser {
             }
         }
 
+        if (hasPpftInput(html)) {
+            throw SessionExpiredException("Session rejected. Microsoft is asking to log in again. (IP may be flagged)")
+        }
+
         return null
     }
 
-    fun hasPpftInput(html: String): Boolean = html.contains("name=\"PPFT\"")
+    fun extractTokenT(html: String): String? = extractTokenT(html, Jsoup.parse(html))
+
+    fun hasPpftInput(html: String): Boolean = ppftRegex.containsMatchIn(html)
 }

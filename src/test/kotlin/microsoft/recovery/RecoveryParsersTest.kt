@@ -1,11 +1,14 @@
 package microsoft.recovery
 
 import kotlinx.serialization.encodeToString
+import microsoft.recovery.alias.SessionExpiredException
 import microsoft.recovery.model.SecurityCleanupRequest
 import microsoft.recovery.util.MicrosoftHttpClientFactory
 import microsoft.recovery.util.RecoveryParsers
+import microsoft.recovery.util.Stage3Parser
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -223,5 +226,60 @@ class RecoveryParsersTest {
         )
         val jsonWithPasskey = MicrosoftHttpClientFactory.json.encodeToString(requestWithPasskey)
         assertTrue(jsonWithPasskey.contains("\"passKeyId\":\"passkey-uuid-999\""))
+    }
+
+    @Test
+    fun testStage3ParserHasPpftInputWithEscapedQuotes() {
+        val jsonHtml = """
+            <html>
+            <script>
+            var ServerData = {"sFTAg":"<input type=\"hidden\" name=\"PPFT\" id=\"i0327\" value=\"PPFT_VAL_123\"/>"};
+            </script>
+            </html>
+        """.trimIndent()
+        assertTrue(Stage3Parser.hasPpftInput(jsonHtml))
+
+        val plainHtml = """<input type="hidden" name="PPFT" value="val"/>"""
+        assertTrue(Stage3Parser.hasPpftInput(plainHtml))
+
+        val singleQuoteHtml = """<input type='hidden' name='PPFT' value='val'/>"""
+        assertTrue(Stage3Parser.hasPpftInput(singleQuoteHtml))
+
+        val uppercaseHtml = """<input type="hidden" NAME="ppft" value="val"/>"""
+        assertTrue(Stage3Parser.hasPpftInput(uppercaseHtml))
+
+        val noPpftHtml = """<html><body>No token or ppft</body></html>"""
+        assertTrue(!Stage3Parser.hasPpftInput(noPpftHtml))
+    }
+
+    @Test
+    fun testStage3ParserExtractTokenTThrowsSessionExpiredWhenPpftPresent() {
+        val htmlWithPpftNoToken = """
+            <html>
+            <script>
+            var ServerData = {"sFTAg":"<input type=\"hidden\" name=\"PPFT\" id=\"i0327\" value=\"PPFT_VAL_123\"/>"};
+            </script>
+            <body>Sign in to your Microsoft account</body>
+            </html>
+        """.trimIndent()
+
+        val ex = assertFailsWith<SessionExpiredException> {
+            Stage3Parser.extractTokenT(htmlWithPpftNoToken)
+        }
+        assertEquals("Session rejected. Microsoft is asking to log in again. (IP may be flagged)", ex.message)
+    }
+
+    @Test
+    fun testStage3ParserExtractTokenTReturnsTokenWhenPresent() {
+        val htmlWithToken = """
+            <html>
+            <form>
+            <input type="hidden" name="t" value="SAMPLE_TOKEN_T"/>
+            </form>
+            </html>
+        """.trimIndent()
+
+        val token = Stage3Parser.extractTokenT(htmlWithToken)
+        assertEquals("SAMPLE_TOKEN_T", token)
     }
 }

@@ -72,6 +72,9 @@ Text: $bodyText
             stageListener?.invoke("4", "Proofs Enumeration", true, "encryptedNetId received")
             context.proofsData = proofsData
             context.activeCanary = proofsData.apiCanary
+            context.emailProofs = proofsData.emailProofs
+            context.smsProofs = proofsData.smsProofs
+            context.passKeyIds = proofsData.passKeyIds
             StageExecution.Success(Unit)
         }
     } catch (e: CancellationException) {

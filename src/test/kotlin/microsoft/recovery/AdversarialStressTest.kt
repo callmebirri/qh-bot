@@ -498,6 +498,7 @@ class AdversarialStressTest {
             requestedPaths.add(request.url.encodedPath)
             when (request.url.encodedPath) {
                 "/API/Proofs/DisableTfa",
+                "/API/Proofs/RevokeWindowsHelloProofs",
                 "/API/Proofs/DeleteDevices",
                 "/API/Proofs/DeleteAppPassword",
                 "/API/Proofs/RemovePasskey" -> respond(
@@ -526,6 +527,7 @@ class AdversarialStressTest {
 
         assertIs<StageExecution.Success<Unit>>(result)
         assertTrue(requestedPaths.contains("/API/Proofs/DisableTfa"))
+        assertTrue(requestedPaths.contains("/API/Proofs/RevokeWindowsHelloProofs"))
         assertTrue(requestedPaths.contains("/API/Proofs/DeleteDevices"))
         assertTrue(requestedPaths.contains("/API/Proofs/DeleteAppPassword"))
         assertTrue(!requestedPaths.contains("/API/Proofs/RemovePasskey"))
@@ -578,8 +580,8 @@ class AdversarialStressTest {
         val stage9 = Stage9Cleanup(stageDelayMs = 0L)
         val result = stage9.execute(context, null)
 
-        assertIs<StageExecution.Success<Unit>>(result)
-        assertEquals(listOf("key-alpha", "key-beta"), requestedPasskeys)
+        assertIs<StageExecution.Failure>(result)
+        assertTrue(requestedPasskeys.isEmpty())
     }
 
     @Test

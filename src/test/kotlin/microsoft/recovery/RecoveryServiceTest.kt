@@ -290,9 +290,11 @@ class RecoveryServiceTest {
                 }
 
                 path == "/API/Proofs/DisableTfa" ||
+                path == "/API/Proofs/RevokeWindowsHelloProofs" ||
                 path == "/API/Proofs/DeleteDevices" ||
                 path == "/API/Proofs/DeleteAppPassword" ||
-                path == "/API/Proofs/RemovePasskey" -> {
+                path == "/API/Proofs/RemovePasskey" ||
+                path == "/API/Proofs/DeleteProof" -> {
                     respond(
                         content = """{"apiCanary": "canary_token_after_cleanup"}""",
                         status = HttpStatusCode.OK,
@@ -547,7 +549,7 @@ class RecoveryServiceTest {
 
         assertIs<RecoveryResult.Failure>(result)
         assertEquals(RecoveryStage.SESSION_POLISH, result.stage)
-        assertEquals("Session expired or invalid, asked to login again.", result.message)
+        assertEquals("Session rejected. Microsoft is asking to log in again. (IP may be flagged)", result.message)
     }
 
     @Test
@@ -585,10 +587,20 @@ class RecoveryServiceTest {
     @Test
     fun testStage3CookieIsolation(): Unit = runBlocking {
         var capturedStage3Cookie: String? = null
+        var capturedReferer: String? = null
+        var capturedSecFetchSite: String? = null
+        var capturedSecFetchMode: String? = null
+        var capturedSecFetchDest: String? = null
+        var capturedSecFetchUser: String? = null
         val engine = createMockEngine(
             extraCookies = true,
             onStage3Request = { req ->
                 capturedStage3Cookie = req.headers[HttpHeaders.Cookie]
+                capturedReferer = req.headers["Referer"]
+                capturedSecFetchSite = req.headers["Sec-Fetch-Site"]
+                capturedSecFetchMode = req.headers["Sec-Fetch-Mode"]
+                capturedSecFetchDest = req.headers["Sec-Fetch-Dest"]
+                capturedSecFetchUser = req.headers["Sec-Fetch-User"]
             },
         )
         val service = RecoveryService(clientEngine = engine, stageDelayMs = 0L)
@@ -603,8 +615,13 @@ class RecoveryServiceTest {
         assertNotNull(capturedStage3Cookie)
         assertTrue(capturedStage3Cookie!!.contains("__Host-MSAAUTH=msa_session_cookie_token"))
         assertTrue(capturedStage3Cookie!!.contains("uaid=server_uaid_9999"))
-        assertTrue(capturedStage3Cookie!!.contains("OParams=legacy_oparams_val"))
-        assertTrue(capturedStage3Cookie!!.contains("PPState=legacy_ppstate_val"))
+        assertTrue(!capturedStage3Cookie!!.contains("OParams"))
+        assertTrue(!capturedStage3Cookie!!.contains("PPState"))
+        assertEquals("https://login.live.com/", capturedReferer)
+        assertEquals("same-origin", capturedSecFetchSite)
+        assertEquals("navigate", capturedSecFetchMode)
+        assertEquals("document", capturedSecFetchDest)
+        assertEquals("?1", capturedSecFetchUser)
     }
 
     @Test
@@ -789,9 +806,11 @@ class RecoveryServiceTest {
                 path == "/API/MakePrimary" ||
                 path == "/names/manage" ||
                 path == "/API/Proofs/DisableTfa" ||
+                path == "/API/Proofs/RevokeWindowsHelloProofs" ||
                 path == "/API/Proofs/DeleteDevices" ||
                 path == "/API/Proofs/DeleteAppPassword" ||
-                path == "/API/Proofs/RemovePasskey"
+                path == "/API/Proofs/RemovePasskey" ||
+                path == "/API/Proofs/DeleteProof"
             ) {
                 stage8Or9Hit = true
                 error("Stage 8/9 endpoint should not be called when stopping at Stage 7: $path")
